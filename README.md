@@ -26,5 +26,8 @@ A high-performance Python-based KTV (Karaoke) and real-time vocal processing app
 
 1. **Clone the repository or save the source code:**
    ```bash
-   git clone [https://github.com/your-username/ktv-vocal-engine.git](https://github.com/your-username/ktv-vocal-engine.git)
+   git clone [https://github.com/Brian-Hou-818/karaoke.git](https://github.com/your-username/ktv-vocal-engine.git)
    cd ktv-vocal-engine
+
+
+   pip install PyQt6 python-vlc sounddevice numpy scipy
