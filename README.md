@@ -31,3 +31,5 @@ A high-performance Python-based KTV (Karaoke) and real-time vocal processing app
 
 
    pip install PyQt6 python-vlc sounddevice numpy scipy
+
+   Addoncrop
