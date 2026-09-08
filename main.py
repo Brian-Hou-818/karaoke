@@ -274,8 +274,9 @@ class VideoDisplayWindow(QWidget):
 # 7. MAIN KTV CONTROL WINDOW
 # ==============================================================================
 class KTVControlWindow(QMainWindow):
-    # Qt Signal for thread-safe UI updates from Flask remote
+    # Qt Signals for thread-safe UI updates from Flask remote
     web_song_added = pyqtSignal(dict)
+    web_action_triggered = pyqtSignal(str)
 
     def __init__(self, display_window):
         super().__init__()
@@ -300,7 +301,7 @@ class KTVControlWindow(QMainWindow):
         )
         self.media_player = self.vlc_instance.media_player_new()
 
-        # Connect VLC video output to VideoDisplayWindow frame with int handle conversion
+        # Connect VLC video output to VideoDisplayWindow frame
         window_handle = int(self.display_win.video_frame.winId())
         if sys.platform.startswith("win"):
             self.media_player.set_hwnd(window_handle)
@@ -312,7 +313,9 @@ class KTVControlWindow(QMainWindow):
         self.poll_timer.timeout.connect(self.check_media_status)
         self.poll_timer.start()
 
+        # Connect thread signals from Web Remote
         self.web_song_added.connect(self.add_song_to_queue)
+        self.web_action_triggered.connect(self.handle_web_action)
 
         self.init_ui()
         self.setup_shortcuts()
@@ -651,6 +654,12 @@ class KTVControlWindow(QMainWindow):
 
         root_layout.addLayout(grid_layout)
 
+    def handle_web_action(self, action):
+        if action == "skip":
+            self.play_next()
+        elif action == "play_pause":
+            self.toggle_play_pause()
+
     def toggle_display_fullscreen(self):
         if self.display_win.isFullScreen():
             self.display_win.showNormal()
@@ -891,6 +900,7 @@ class KTVControlWindow(QMainWindow):
         media = self.vlc_instance.media_new(song["path"])
         self.media_player.set_media(media)
         self.media_player.play()
+        self.btn_play_pause.setText("⏸ Pause")
 
         # Re-apply current volume
         self.change_music_volume(self.music_vol_slider.value())
@@ -951,16 +961,59 @@ HTML_TEMPLATE = """
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 15px; background: #0f172a; color: #fff; margin: 0; }
         h2, h3 { text-align: center; margin-top: 10px; color: #38bdf8; }
+        .now-playing-box {
+            background: #1e293b;
+            border: 1px solid #38bdf8;
+            border-radius: 10px;
+            padding: 12px;
+            text-align: center;
+            margin-bottom: 15px;
+        }
+        .now-playing-title {
+            font-weight: bold;
+            font-size: 16px;
+            color: #38bdf8;
+            margin-top: 4px;
+        }
+        .controls-row {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            margin-top: 10px;
+        }
+        .btn-ctrl {
+            flex: 1;
+            padding: 10px 16px;
+            font-size: 15px;
+            font-weight: bold;
+            border-radius: 8px;
+            border: none;
+            color: white;
+            cursor: pointer;
+        }
+        .btn-play { background: #16a34a; }
+        .btn-play:active { background: #15803d; }
+        .btn-skip { background: #d97706; }
+        .btn-skip:active { background: #b45309; }
         input { width: 100%; padding: 12px; box-sizing: border-box; border-radius: 8px; border: 1px solid #334155; background: #1e293b; color: white; font-size: 16px; margin-bottom: 15px; }
         ul { list-style: none; padding: 0; margin: 0; }
         li { background: #1e293b; margin-bottom: 8px; padding: 12px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; border: 1px solid #334155; }
-        button { background: #2563eb; color: white; border: none; padding: 8px 14px; border-radius: 6px; font-weight: bold; cursor: pointer; }
-        button:active { background: #1d4ed8; }
+        button.btn-add { background: #2563eb; color: white; border: none; padding: 8px 14px; border-radius: 6px; font-weight: bold; cursor: pointer; }
+        button.btn-add:active { background: #1d4ed8; }
         .queue-item { background: #0f172a; border-left: 4px solid #38bdf8; }
     </style>
 </head>
 <body>
     <h2>🎤 KTV Remote</h2>
+
+    <div class="now-playing-box">
+        <div style="font-size: 12px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px;">Now Playing</div>
+        <div id="nowPlayingText" class="now-playing-title">None</div>
+        <div class="controls-row">
+            <button id="btnPlayPause" class="btn-ctrl btn-play" onclick="triggerAction('play_pause')">⏯ Pause / Play</button>
+            <button class="btn-ctrl btn-skip" onclick="triggerAction('skip')">⏭ Skip</button>
+        </div>
+    </div>
 
     <h3>Current Queue</h3>
     <ul id="queueList"></ul>
@@ -973,6 +1026,20 @@ HTML_TEMPLATE = """
 
     <script>
         let fullLibrary = [];
+
+        function fetchStatus() {
+            fetch('/api/status')
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('nowPlayingText').innerText = data.now_playing || 'None';
+                    const btn = document.getElementById('btnPlayPause');
+                    if (data.is_playing) {
+                        btn.innerText = '⏸ Pause';
+                    } else {
+                        btn.innerText = '▶ Play';
+                    }
+                });
+        }
 
         function fetchQueue() {
             fetch('/api/queue')
@@ -1005,7 +1072,7 @@ HTML_TEMPLATE = """
             list.innerHTML = songs.map(song => `
                 <li>
                     <span>${song}</span>
-                    <button onclick="addSong('${song.replace(/'/g, "\\'")}')">Add</button>
+                    <button class="btn-add" onclick="addSong('${song.replace(/'/g, "\\'")}')">Add</button>
                 </li>
             `).join('');
         }
@@ -1026,7 +1093,23 @@ HTML_TEMPLATE = """
             });
         }
 
-        setInterval(fetchQueue, 3000);
+        function triggerAction(actionName) {
+            fetch('/api/action', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ action: actionName })
+            }).then(() => {
+                fetchStatus();
+                fetchQueue();
+            });
+        }
+
+        setInterval(() => {
+            fetchStatus();
+            fetchQueue();
+        }, 2000);
+
+        fetchStatus();
         fetchQueue();
         fetchLibrary();
     </script>
@@ -1038,6 +1121,19 @@ HTML_TEMPLATE = """
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
+
+
+@app.route("/api/status", methods=["GET"])
+def get_status():
+    if control_win:
+        now_playing = (
+            control_win.current_song["name"]
+            if control_win.current_song
+            else "None"
+        )
+        is_playing = control_win.media_player.is_playing() == 1
+        return jsonify({"now_playing": now_playing, "is_playing": is_playing})
+    return jsonify({"now_playing": "None", "is_playing": False})
 
 
 @app.route("/api/library", methods=["GET"])
@@ -1063,13 +1159,26 @@ def post_queue():
 
     if song_name and control_win:
         matched_song = next(
-            (s for s in control_win.song_library if s["name"] == song_name), None
+            (s for s in control_win.song_library if s["name"] == song_name),
+            None,
         )
         if matched_song:
             control_win.web_song_added.emit(matched_song)
             return jsonify({"status": "success", "song": song_name}), 200
 
     return jsonify({"status": "error", "message": "Song not found"}), 400
+
+
+@app.route("/api/action", methods=["POST"])
+def trigger_action():
+    data = request.get_json()
+    action = data.get("action")
+
+    if action and control_win:
+        control_win.web_action_triggered.emit(action)
+        return jsonify({"status": "success", "action": action}), 200
+
+    return jsonify({"status": "error", "message": "Invalid action"}), 400
 
 
 def start_flask_server():
