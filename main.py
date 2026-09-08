@@ -1,13 +1,21 @@
-import os
-import sys
 import ctypes
+import os
 import random
+import sys
+import threading
 from pathlib import Path
-import sounddevice as sd
+from queue import Queue
+
+# Ensure Qt uses X11 (xcb) on Linux to support VLC window embedding
+if not sys.platform.startswith("win"):
+    os.environ["QT_QPA_PLATFORM"] = "xcb"
+
+from flask import Flask, jsonify, render_template_string, request
 import numpy as np
 
 # SciPy DSP for Parametric EQ calculation
 from scipy.signal import butter, iirnotch, sosfilt
+import sounddevice as sd
 
 # ==============================================================================
 # 1. WINDOWS / LINUX DLL PATCH & SETUP FOR PYTHON-VLC
@@ -16,8 +24,8 @@ VLC_PATH = r"C:\Program Files\VideoLAN\VLC"
 
 if os.path.exists(VLC_PATH):
     os.add_dll_directory(VLC_PATH)
-    os.environ['PATH'] = VLC_PATH + os.pathsep + os.environ['PATH']
-    os.environ['PYTHON_VLC_MODULE_PATH'] = VLC_PATH
+    os.environ["PATH"] = VLC_PATH + os.pathsep + os.environ["PATH"]
+    os.environ["PYTHON_VLC_MODULE_PATH"] = VLC_PATH
 
 _orig_cdll_init = ctypes.CDLL.__init__
 
@@ -28,7 +36,7 @@ def _patched_cdll_init(self, name, *args, **kwargs):
         abs_vlc_path = os.path.join(VLC_PATH, dll_name)
         if os.path.exists(abs_vlc_path):
             name = abs_vlc_path
-        kwargs['winmode'] = 0
+        kwargs["winmode"] = 0
     _orig_cdll_init(self, name, *args, **kwargs)
 
 
@@ -41,17 +49,30 @@ ctypes.CDLL.__init__ = _orig_cdll_init
 # ==============================================================================
 # 2. APPLICATION IMPORTS
 # ==============================================================================
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QKeyEvent, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QListWidget, QFileDialog, QLabel, QFrame, QLineEdit,
-    QListWidgetItem, QSlider, QComboBox, QAbstractItemView, QCheckBox,
-    QGroupBox, QGridLayout
+    QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QPushButton,
+    QSlider,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QKeyEvent, QShortcut, QKeySequence
 
 
-# Helper function to truncate strings to a maximum character length for "Now Playing"
 def get_truncated_title(title, max_length=10):
     if len(title) > max_length:
         return title[: max_length - 3] + "..."
@@ -59,39 +80,35 @@ def get_truncated_title(title, max_length=10):
 
 
 # ==============================================================================
-# 3. DSP PARAMETRIC EQUALIZER FUNCTION (VOCAL BAND SUPPRESSION)
+# 3. DSP PARAMETRIC EQUALIZER FUNCTION
 # ==============================================================================
 def apply_parametric_vocal_eq(audio_data, sample_rate=44100):
-    """
-    Applies a Parametric EQ filter targeting human voice frequencies:
-    - High-Pass Filter @ 100 Hz (cuts low vocal rumble)
-    - Low-Pass Filter @ 8,000 Hz (cuts high vocal sibilance 'S'/'T' sounds)
-    - Wide Q Notch Filters scoops 80 Hz - 4,000 Hz vocal formants (-18 dB attenuation)
-    """
     if audio_data.size == 0:
         return audio_data
 
     processed = audio_data.copy()
 
     # 1. High-Pass Filter (< 100 Hz cut)
-    hp_sos = butter(2, 100, btype='highpass', fs=sample_rate, output='sos')
+    hp_sos = butter(2, 100, btype="highpass", fs=sample_rate, output="sos")
     processed = sosfilt(hp_sos, processed, axis=0)
 
     # 2. Low-Pass Filter (> 8,000 Hz cut)
-    lp_sos = butter(2, 8000, btype='lowpass', fs=sample_rate, output='sos')
+    lp_sos = butter(2, 8000, btype="lowpass", fs=sample_rate, output="sos")
     processed = sosfilt(lp_sos, processed, axis=0)
 
     # 3. Parametric Vocal Notch Band Cuts (80 Hz - 4,000 Hz core vocal range)
     vocal_center_frequencies = [250, 800, 1500, 3000]
-    wide_q_factor = 0.85  # Covers broad vocal band
+    wide_q_factor = 0.85
 
     for freq in vocal_center_frequencies:
         b, a = iirnotch(freq, wide_q_factor, fs=sample_rate)
         if processed.ndim > 1:
             for ch in range(processed.shape[1]):
-                processed[:, ch] = np.convolve(processed[:, ch], b, mode='same')
+                processed[:, ch] = np.convolve(
+                    processed[:, ch], b, mode="same"
+                )
         else:
-            processed = np.convolve(processed, b, mode='same')
+            processed = np.convolve(processed, b, mode="same")
 
     return np.clip(processed * 0.3, -1.0, 1.0)
 
@@ -100,19 +117,15 @@ def apply_parametric_vocal_eq(audio_data, sample_rate=44100):
 # 4. LOW-LATENCY SOFTWARE AUDIO STREAM WITH ECHO / REVERB DSP
 # ==============================================================================
 class AudioPassthroughStream:
-    """ Ultra-low latency audio stream with optimized feedback echo/reverb DSP """
-
     def __init__(self, input_device_id, output_device_id=None, sample_rate=44100):
         self.input_device_id = input_device_id
         self.output_device_id = output_device_id
         self.sample_rate = sample_rate
         self.volume = 1.0
 
-        # DSP Echo Parameters
         self.echo_delay_ms = 180
         self.echo_feedback = 0.4
 
-        # Pre-allocated delay buffer
         self.buffer_size = sample_rate * 2
         self.delay_buffer = np.zeros((self.buffer_size, 2), dtype=np.float32)
         self.write_pos = 0
@@ -123,24 +136,24 @@ class AudioPassthroughStream:
     def _audio_callback(self, indata, outdata, frames, time, status):
         out_channels = outdata.shape[1]
 
-        # Quick channel matching without unnecessary copies
         if indata.shape[1] == 1 and out_channels == 2:
             in_samples = np.column_stack((indata[:, 0], indata[:, 0]))
         else:
             in_samples = indata[:, :out_channels]
 
-        # Apply Mic Gain
         processed = in_samples * self.volume
 
-        # Vectorized ring-buffer read/write for low-latency processing
         delay_samples = int((self.echo_delay_ms / 1000.0) * self.sample_rate)
-        read_indices = (np.arange(self.write_pos, self.write_pos + frames) - delay_samples) % self.buffer_size
-        write_indices = (np.arange(self.write_pos, self.write_pos + frames)) % self.buffer_size
+        read_indices = (
+            np.arange(self.write_pos, self.write_pos + frames) - delay_samples
+        ) % self.buffer_size
+        write_indices = (
+            np.arange(self.write_pos, self.write_pos + frames)
+        ) % self.buffer_size
 
         delayed_samples = self.delay_buffer[read_indices, :out_channels]
         mixed_samples = processed + (delayed_samples * self.echo_feedback)
 
-        # Write mixed samples back to buffer for feedback decay
         self.delay_buffer[write_indices, :out_channels] = mixed_samples
         self.write_pos = (self.write_pos + frames) % self.buffer_size
 
@@ -151,19 +164,18 @@ class AudioPassthroughStream:
             return
         try:
             dev_info = sd.query_devices(self.input_device_id)
-            channels = min(dev_info['max_input_channels'], 2)
+            channels = min(dev_info["max_input_channels"], 2)
 
             device_tuple = (self.input_device_id, self.output_device_id)
 
-            # --- LOW-LATENCY OPTIMIZATIONS ---
             self.stream = sd.Stream(
                 device=device_tuple,
                 samplerate=self.sample_rate,
                 blocksize=64,
-                latency='low',
+                latency="low",
                 channels=channels,
-                dtype='float32',
-                callback=self._audio_callback
+                dtype="float32",
+                callback=self._audio_callback,
             )
             self.stream.start()
             self.is_running = True
@@ -174,10 +186,10 @@ class AudioPassthroughStream:
                     device=device_tuple,
                     samplerate=self.sample_rate,
                     blocksize=128,
-                    latency='low',
+                    latency="low",
                     channels=channels,
-                    dtype='float32',
-                    callback=self._audio_callback
+                    dtype="float32",
+                    callback=self._audio_callback,
                 )
                 self.stream.start()
                 self.is_running = True
@@ -203,8 +215,6 @@ class AudioPassthroughStream:
 # 5. DRAG AND DROP QUEUE WIDGET
 # ==============================================================================
 class DraggableQueueList(QListWidget):
-    """ Custom QListWidget that handles drag-and-drop reordering """
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setDragEnabled(True)
@@ -224,8 +234,6 @@ class DraggableQueueList(QListWidget):
 # 6. DEDICATED SECONDARY VIDEO DISPLAY WINDOW
 # ==============================================================================
 class VideoDisplayWindow(QWidget):
-    """ Standalone window dedicated purely to video output """
-
     def __init__(self):
         super().__init__()
         self.setWindowTitle("KTV Video Display")
@@ -246,7 +254,11 @@ class VideoDisplayWindow(QWidget):
                 self.showNormal()
             else:
                 self.showFullScreen()
-        elif event.key() in (Qt.Key.Key_N, Qt.Key.Key_Right, Qt.Key.Key_MediaNext):
+        elif event.key() in (
+            Qt.Key.Key_N,
+            Qt.Key.Key_Right,
+            Qt.Key.Key_MediaNext,
+        ):
             if self.skip_callback:
                 self.skip_callback()
         super().keyPressEvent(event)
@@ -262,6 +274,9 @@ class VideoDisplayWindow(QWidget):
 # 7. MAIN KTV CONTROL WINDOW
 # ==============================================================================
 class KTVControlWindow(QMainWindow):
+    # Qt Signal for thread-safe UI updates from Flask remote
+    web_song_added = pyqtSignal(dict)
+
     def __init__(self, display_window):
         super().__init__()
         self.display_win = display_window
@@ -270,48 +285,60 @@ class KTVControlWindow(QMainWindow):
         self.setWindowTitle("KTV Control Panel")
         self.setGeometry(80, 80, 950, 950)
 
-        # Default Library Directory to Downloads folder
         self.current_folder = str(Path.home() / "Downloads")
 
-        # App State
         self.song_library = []
         self.selected_queue = []
         self.current_song = None
         self.vocal_eq_active = False
 
-        # Audio Streams
         self.mic1_stream = None
         self.mic2_stream = None
 
-        # VLC Engine
-        self.vlc_instance = vlc.Instance('--aout=directsound' if sys.platform.startswith('win') else '')
+        self.vlc_instance = vlc.Instance(
+            "--aout=directsound" if sys.platform.startswith("win") else ""
+        )
         self.media_player = self.vlc_instance.media_player_new()
 
-        # Polling Timer for Autoplay / Media End Detection
+        # Connect VLC video output to VideoDisplayWindow frame with int handle conversion
+        window_handle = int(self.display_win.video_frame.winId())
+        if sys.platform.startswith("win"):
+            self.media_player.set_hwnd(window_handle)
+        else:
+            self.media_player.set_xwindow(window_handle)
+
         self.poll_timer = QTimer(self)
         self.poll_timer.setInterval(500)
         self.poll_timer.timeout.connect(self.check_media_status)
         self.poll_timer.start()
 
+        self.web_song_added.connect(self.add_song_to_queue)
+
         self.init_ui()
         self.setup_shortcuts()
         self.populate_audio_devices()
 
-        # Initial scan of Downloads directory
         self.scan_folder_for_songs(self.current_folder)
 
     def setup_shortcuts(self):
-        """ Configures hotkeys to skip songs from the control window """
         self.shortcut_n = QShortcut(QKeySequence("N"), self)
         self.shortcut_n.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self.shortcut_n.activated.connect(self.play_next)
 
-        self.shortcut_ctrl_right = QShortcut(QKeySequence("Ctrl+Right"), self)
-        self.shortcut_ctrl_right.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.shortcut_ctrl_right = QShortcut(
+            QKeySequence("Ctrl+Right"), self
+        )
+        self.shortcut_ctrl_right.setContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
         self.shortcut_ctrl_right.activated.connect(self.play_next)
 
-        self.shortcut_media_next = QShortcut(QKeySequence(Qt.Key.Key_MediaNext), self)
-        self.shortcut_media_next.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.shortcut_media_next = QShortcut(
+            QKeySequence(Qt.Key.Key_MediaNext), self
+        )
+        self.shortcut_media_next.setContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
         self.shortcut_media_next.activated.connect(self.play_next)
 
     def init_ui(self):
@@ -372,7 +399,6 @@ class KTVControlWindow(QMainWindow):
             QCheckBox { color: #f8fafc; font-weight: bold; font-size: 12px; }
             QCheckBox::indicator { width: 18px; height: 18px; }
 
-            /* LARGE SPACIOUS SLIDERS */
             QSlider::groove:horizontal {
                 border: 1px solid #334155; height: 10px; 
                 background: #0f172a; border-radius: 5px;
@@ -393,13 +419,11 @@ class KTVControlWindow(QMainWindow):
         root_layout.setSpacing(12)
         root_layout.setContentsMargins(16, 16, 16, 16)
 
-        # ==============================================================================
-        # TOP TOOLBAR: STATUS & GLOBAL CONTROLS
-        # ==============================================================================
         top_bar = QHBoxLayout()
-
         self.now_playing_label = QLabel("<b>Now Playing:</b> None")
-        self.now_playing_label.setStyleSheet("color: #38bdf8; font-size: 15px;")
+        self.now_playing_label.setStyleSheet(
+            "color: #38bdf8; font-size: 15px;"
+        )
         top_bar.addWidget(self.now_playing_label, stretch=1)
 
         self.btn_fullscreen = QPushButton("🖥️ Display Window (F)")
@@ -416,19 +440,12 @@ class KTVControlWindow(QMainWindow):
 
         root_layout.addLayout(top_bar)
 
-        # ==============================================================================
-        # MAIN GRID CONTENT
-        # ==============================================================================
         grid_layout = QHBoxLayout()
         grid_layout.setSpacing(16)
 
-        # ------------------------------------------------------------------------------
-        # LEFT COLUMN: AUDIO, MUSIC & MIC CONTROL CARDS
-        # ------------------------------------------------------------------------------
         left_col = QVBoxLayout()
         left_col.setSpacing(12)
 
-        # 0. HARDWARE AUDIO OUTPUT SELECTION CARD
         out_box = QGroupBox("🔊 Output Hardware Device")
         out_layout = QVBoxLayout(out_box)
         out_layout.setSpacing(10)
@@ -436,13 +453,13 @@ class KTVControlWindow(QMainWindow):
         out_dev_row = QHBoxLayout()
         out_dev_row.addWidget(QLabel("<b>Output:</b>"))
         self.output_combo = QComboBox()
-        self.output_combo.currentIndexChanged.connect(self.on_output_device_changed)
+        self.output_combo.currentIndexChanged.connect(
+            self.on_output_device_changed
+        )
         out_dev_row.addWidget(self.output_combo, stretch=1)
         out_layout.addLayout(out_dev_row)
-
         left_col.addWidget(out_box)
 
-        # 1. MUSIC PLAYBACK CARD
         music_box = QGroupBox("🎵 Music Playback & Audio Control")
         music_layout = QVBoxLayout(music_box)
         music_layout.setSpacing(10)
@@ -473,7 +490,9 @@ class KTVControlWindow(QMainWindow):
         track_row = QHBoxLayout()
         track_row.addWidget(QLabel("<b>Track Mode:</b>"))
         self.btn_stereo = QPushButton("Stereo")
-        self.btn_stereo.clicked.connect(lambda: self.set_audio_channel("stereo"))
+        self.btn_stereo.clicked.connect(
+            lambda: self.set_audio_channel("stereo")
+        )
         track_row.addWidget(self.btn_stereo)
 
         self.btn_left = QPushButton("Music (L)")
@@ -485,9 +504,10 @@ class KTVControlWindow(QMainWindow):
         track_row.addWidget(self.btn_right)
         music_layout.addLayout(track_row)
 
-        # PARAMETRIC VOCAL EQ DSP TOGGLE
         eq_row = QHBoxLayout()
-        self.btn_vocal_eq = QPushButton("🎙️ Vocal Parametric EQ (80-4kHz Cut): OFF")
+        self.btn_vocal_eq = QPushButton(
+            "🎙️ Vocal Parametric EQ (80-4kHz Cut): OFF"
+        )
         self.btn_vocal_eq.setObjectName("eqFilterOff")
         self.btn_vocal_eq.clicked.connect(self.toggle_vocal_eq)
         eq_row.addWidget(self.btn_vocal_eq)
@@ -507,7 +527,6 @@ class KTVControlWindow(QMainWindow):
 
         left_col.addWidget(music_box)
 
-        # 2. MICROPHONE 1 CARD
         mic1_box = QGroupBox("🎙️ Microphone 1 Controls")
         mic1_layout = QVBoxLayout(mic1_box)
         mic1_layout.setSpacing(10)
@@ -535,7 +554,6 @@ class KTVControlWindow(QMainWindow):
 
         left_col.addWidget(mic1_box)
 
-        # 3. MICROPHONE 2 CARD
         mic2_box = QGroupBox("🎙️ Microphone 2 Controls")
         mic2_layout = QVBoxLayout(mic2_box)
         mic2_layout.setSpacing(10)
@@ -563,7 +581,6 @@ class KTVControlWindow(QMainWindow):
 
         left_col.addWidget(mic2_box)
 
-        # 4. MASTER ECHO & REVERB DSP CARD
         echo_box = QGroupBox("✨ Master Vocal Echo & Reverb")
         echo_layout = QVBoxLayout(echo_box)
         echo_layout.setSpacing(10)
@@ -596,13 +613,9 @@ class KTVControlWindow(QMainWindow):
 
         grid_layout.addLayout(left_col, stretch=1)
 
-        # ------------------------------------------------------------------------------
-        # RIGHT COLUMN: SEARCH BROWSER & DRAG/DROP QUEUE
-        # ------------------------------------------------------------------------------
         right_col = QVBoxLayout()
         right_col.setSpacing(12)
 
-        # 1. SEARCH BROWSER
         right_col.addWidget(QLabel("<b>🔍 Browse Song Library</b>"))
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("Search title or artist...")
@@ -610,16 +623,21 @@ class KTVControlWindow(QMainWindow):
         right_col.addWidget(self.search_bar)
 
         self.library_list_widget = QListWidget()
-        self.library_list_widget.itemDoubleClicked.connect(self.add_selected_song_from_browser)
+        self.library_list_widget.itemDoubleClicked.connect(
+            self.add_selected_song_from_browser
+        )
         right_col.addWidget(self.library_list_widget, stretch=1)
 
         self.btn_add_browser = QPushButton("➕ Add Selected to Queue")
         self.btn_add_browser.setObjectName("primaryBtn")
-        self.btn_add_browser.clicked.connect(self.add_selected_song_from_browser)
+        self.btn_add_browser.clicked.connect(
+            self.add_selected_song_from_browser
+        )
         right_col.addWidget(self.btn_add_browser)
 
-        # 2. SELECTED SONGS QUEUE
-        right_col.addWidget(QLabel("<b>📋 Selected Songs Queue</b> <i>(Drag to reorder)</i>"))
+        right_col.addWidget(
+            QLabel("<b>📋 Selected Songs Queue</b> <i>(Drag to reorder)</i>")
+        )
 
         self.queue_widget = DraggableQueueList()
         self.queue_widget.reorder_callback = self.on_queue_reordered
@@ -640,7 +658,6 @@ class KTVControlWindow(QMainWindow):
             self.display_win.showFullScreen()
 
     def populate_audio_devices(self):
-        """ Populate input (mics) and output (speakers) hardware devices """
         self.mic1_combo.clear()
         self.mic2_combo.clear()
         self.output_combo.clear()
@@ -649,21 +666,18 @@ class KTVControlWindow(QMainWindow):
         default_out_idx = sd.default.device[1]
 
         for idx, dev in enumerate(devices):
-            # Input devices
-            if dev['max_input_channels'] > 0:
+            if dev["max_input_channels"] > 0:
                 name = f"[{idx}] {dev['name']}"
                 self.mic1_combo.addItem(name, userData=idx)
                 self.mic2_combo.addItem(name, userData=idx)
 
-            # Output devices
-            if dev['max_output_channels'] > 0:
+            if dev["max_output_channels"] > 0:
                 name = f"[{idx}] {dev['name']}"
                 self.output_combo.addItem(name, userData=idx)
 
         if self.mic2_combo.count() > 1:
             self.mic2_combo.setCurrentIndex(1)
 
-        # Select default system output device in combo box
         for i in range(self.output_combo.count()):
             if self.output_combo.itemData(i) == default_out_idx:
                 self.output_combo.setCurrentIndex(i)
@@ -675,42 +689,48 @@ class KTVControlWindow(QMainWindow):
     def on_output_device_changed(self):
         out_id = self.get_selected_output_device_id()
 
-        # Update Mic 1
         if self.mic1_stream and self.mic1_stream.is_running:
             self.mic1_stream.stop()
-            self.mic1_stream = AudioPassthroughStream(self.mic1_stream.input_device_id, out_id)
+            self.mic1_stream = AudioPassthroughStream(
+                self.mic1_stream.input_device_id, out_id
+            )
             self.mic1_stream.start()
 
-        # Update Mic 2
         if self.mic2_stream and self.mic2_stream.is_running:
             self.mic2_stream.stop()
-            self.mic2_stream = AudioPassthroughStream(self.mic2_stream.input_device_id, out_id)
+            self.mic2_stream = AudioPassthroughStream(
+                self.mic2_stream.input_device_id, out_id
+            )
             self.mic2_stream.start()
 
         self.update_mic_settings()
         self.sync_vlc_output_device()
 
     def sync_vlc_output_device(self):
-        """ Syncs VLC audio output with the selected sounddevice output """
         out_id = self.get_selected_output_device_id()
         if out_id is None:
             return
 
-        target_name = sd.query_devices(out_id)['name']
+        target_name = sd.query_devices(out_id)["name"]
 
-        # Enumerate VLC audio outputs to find matching device
         device_enum = self.media_player.audio_output_device_enum()
         if device_enum:
             curr = device_enum
             while curr:
                 dev_id = curr.contents.device
-                dev_desc = curr.contents.description.decode('utf-8', errors='ignore') if curr.contents.description else ""
-                if target_name.lower() in dev_desc.lower() or dev_desc.lower() in target_name.lower():
+                dev_desc = (
+                    curr.contents.description.decode("utf-8", errors="ignore")
+                    if curr.contents.description
+                    else ""
+                )
+                if (
+                    target_name.lower() in dev_desc.lower()
+                    or dev_desc.lower() in target_name.lower()
+                ):
                     self.media_player.audio_output_device_set(None, dev_id)
                     break
                 curr = curr.contents.next
 
-            # FIX: Correct method name in python-vlc for releasing device list
             vlc.libvlc_audio_output_device_list_release(device_enum)
 
     def toggle_mic1(self):
@@ -775,43 +795,47 @@ class KTVControlWindow(QMainWindow):
 
         for root, _, files in os.walk(folder_path):
             for file in files:
-                if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov')):
+                if file.lower().endswith(
+                    (".mp4", ".mkv", ".avi", ".mov", ".webm", ".mp3")
+                ):
                     full_path = os.path.join(root, file)
                     song_name = os.path.splitext(file)[0]
-                    self.song_library.append({'name': song_name, 'path': full_path})
+                    self.song_library.append(
+                        {"name": song_name, "path": full_path}
+                    )
 
         self.populate_library_list(self.song_library)
 
     def select_folder(self):
-        folder_path = QFileDialog.getExistingDirectory(self, "Select KTV Songs Folder", self.current_folder)
+        folder_path = QFileDialog.getExistingDirectory(
+            self, "Select KTV Songs Directory", self.current_folder
+        )
         if folder_path:
             self.scan_folder_for_songs(folder_path)
 
     def refresh_library(self):
         self.scan_folder_for_songs(self.current_folder)
-        if self.search_bar.text():
-            self.filter_songs(self.search_bar.text())
 
-    def populate_library_list(self, songs):
+    def populate_library_list(self, song_list):
         self.library_list_widget.clear()
-        for song in songs:
-            item = QListWidgetItem(song['name'])
+        for song in song_list:
+            item = QListWidgetItem(song["name"])
             item.setData(Qt.ItemDataRole.UserRole, song)
             self.library_list_widget.addItem(item)
 
     def filter_songs(self, text):
-        search_term = text.lower().strip()
-        if not search_term:
-            self.populate_library_list(self.song_library)
-            return
-
-        filtered = [s for s in self.song_library if search_term in s['name'].lower()]
+        query = text.lower()
+        filtered = [
+            s for s in self.song_library if query in s["name"].lower()
+        ]
         self.populate_library_list(filtered)
 
     def add_selected_song_from_browser(self):
-        current_item = self.library_list_widget.currentItem()
-        if current_item:
-            song = current_item.data(Qt.ItemDataRole.UserRole)
+        selected_items = self.library_list_widget.selectedItems()
+        if not selected_items:
+            return
+        for item in selected_items:
+            song = item.data(Qt.ItemDataRole.UserRole)
             self.add_song_to_queue(song)
 
     def add_song_to_queue(self, song):
@@ -821,137 +845,254 @@ class KTVControlWindow(QMainWindow):
         if not self.media_player.is_playing() and not self.current_song:
             self.play_next()
 
-    def remove_from_queue(self):
-        selected_row = self.queue_widget.currentRow()
-        if 0 <= selected_row < len(self.selected_queue):
-            del self.selected_queue[selected_row]
-            self.refresh_queue_widget()
+    def refresh_queue_widget(self):
+        self.queue_widget.clear()
+        for song in self.selected_queue:
+            item = QListWidgetItem(song["name"])
+            item.setData(Qt.ItemDataRole.UserRole, song)
+            self.queue_widget.addItem(item)
 
     def on_queue_reordered(self):
         new_queue = []
         for i in range(self.queue_widget.count()):
             item = self.queue_widget.item(i)
-            song_data = item.data(Qt.ItemDataRole.UserRole)
-            if song_data:
-                new_queue.append(song_data)
+            new_queue.append(item.data(Qt.ItemDataRole.UserRole))
         self.selected_queue = new_queue
-        self.refresh_queue_widget()
 
-    def refresh_queue_widget(self):
-        self.queue_widget.blockSignals(True)
-        self.queue_widget.clear()
-        for idx, song in enumerate(self.selected_queue, start=1):
-            item = QListWidgetItem(f"≡  {idx}. {song['name']}")
-            item.setData(Qt.ItemDataRole.UserRole, song)
-            self.queue_widget.addItem(item)
-        self.queue_widget.blockSignals(False)
+    def remove_from_queue(self):
+        selected_items = self.queue_widget.selectedItems()
+        if not selected_items:
+            return
+        for item in selected_items:
+            song = item.data(Qt.ItemDataRole.UserRole)
+            if song in self.selected_queue:
+                self.selected_queue.remove(song)
+        self.refresh_queue_widget()
 
     def play_next(self):
         if self.selected_queue:
-            self.current_song = self.selected_queue.pop(0)
+            song = self.selected_queue.pop(0)
             self.refresh_queue_widget()
-            display_name = get_truncated_title(self.current_song['name'], 10)
-            self.now_playing_label.setText(f"<b>Now Playing:</b> {display_name}")
+            self.play_song(song)
         elif self.chk_auto_random.isChecked() and self.song_library:
-            self.current_song = random.choice(self.song_library)
-            display_name = get_truncated_title(self.current_song['name'], 10)
-            self.now_playing_label.setText(f"<b>Now Playing (Random):</b> 🎲 {display_name}")
+            random_song = random.choice(self.song_library)
+            self.play_song(random_song)
         else:
-            self.current_song = None
             self.media_player.stop()
-            self.now_playing_label.setText("<b>Now Playing:</b> Finished")
-            self.btn_play_pause.setText("▶ Play")
-            return
+            self.current_song = None
+            self.now_playing_label.setText("<b>Now Playing:</b> None")
 
-        media = self.vlc_instance.media_new(self.current_song['path'])
+    def play_song(self, song):
+        self.current_song = song
+        self.now_playing_label.setText(
+            f"<b>Now Playing:</b> {get_truncated_title(song['name'], 40)}"
+        )
+
+        media = self.vlc_instance.media_new(song["path"])
         self.media_player.set_media(media)
-
-        # Cross-platform window embedding
-        if sys.platform.startswith('win'):
-            self.media_player.set_hwnd(int(self.display_win.video_frame.winId()))
-        else:
-            self.media_player.set_xwindow(int(self.display_win.video_frame.winId()))
-
         self.media_player.play()
-        self.sync_vlc_output_device()
-        self.media_player.audio_set_volume(self.music_vol_slider.value())
-        self.btn_play_pause.setText("⏸ Pause")
 
-        if self.vocal_eq_active:
-            self.apply_vlc_vocal_eq(True)
-
-    def check_media_status(self):
-        state = self.media_player.get_state()
-        if state == vlc.State.Ended:
-            if self.chk_autoplay.isChecked():
-                self.play_next()
-            else:
-                self.current_song = None
-                self.now_playing_label.setText("<b>Now Playing:</b> Finished")
-                self.btn_play_pause.setText("▶ Play")
+        # Re-apply current volume
+        self.change_music_volume(self.music_vol_slider.value())
 
     def toggle_play_pause(self):
         if self.media_player.is_playing():
             self.media_player.pause()
             self.btn_play_pause.setText("▶ Play")
         else:
-            if not self.current_song:
-                self.play_next()
-            else:
-                self.media_player.play()
-                self.btn_play_pause.setText("⏸ Pause")
+            self.media_player.play()
+            self.btn_play_pause.setText("⏸ Pause")
+
+    def set_audio_channel(self, mode):
+        if mode == "stereo":
+            self.media_player.audio_set_channel(vlc.AudioOutputChannel.Stereo)
+        elif mode == "left":
+            self.media_player.audio_set_channel(vlc.AudioOutputChannel.Left)
+        elif mode == "right":
+            self.media_player.audio_set_channel(vlc.AudioOutputChannel.Right)
+
+    def toggle_vocal_eq(self):
+        self.vocal_eq_active = not self.vocal_eq_active
+        if self.vocal_eq_active:
+            self.btn_vocal_eq.setText(
+                "🎙️ Vocal Parametric EQ (80-4kHz Cut): ON"
+            )
+            self.btn_vocal_eq.setObjectName("eqFilterOn")
+        else:
+            self.btn_vocal_eq.setText(
+                "🎙️ Vocal Parametric EQ (80-4kHz Cut): OFF"
+            )
+            self.btn_vocal_eq.setObjectName("eqFilterOff")
+        self.btn_vocal_eq.setStyle(self.btn_vocal_eq.style())
 
     def change_music_volume(self, value):
         self.media_player.audio_set_volume(value)
         self.music_vol_label.setText(f"{value}%")
 
-    def set_audio_channel(self, mode):
-        if mode == "left":
-            self.media_player.audio_set_channel(3)  # Left channel
-        elif mode == "right":
-            self.media_player.audio_set_channel(4)  # Right channel
-        else:
-            self.media_player.audio_set_channel(1)  # Stereo
-
-    def apply_vlc_vocal_eq(self, enable):
-        if enable:
-            eq = vlc.AudioEqualizer()
-            # Scoop vocal frequencies in VLC's standard 10-band equalizer
-            eq.set_amp_at_index(-15.0, 3)  # 250 Hz
-            eq.set_amp_at_index(-18.0, 4)  # 500 Hz
-            eq.set_amp_at_index(-18.0, 5)  # 1 kHz
-            eq.set_amp_at_index(-15.0, 6)  # 2 kHz
-            eq.set_amp_at_index(-12.0, 7)  # 4 kHz
-            self.media_player.set_equalizer(eq)
-        else:
-            self.media_player.set_equalizer(None)
-
-    def toggle_vocal_eq(self):
-        self.vocal_eq_active = not self.vocal_eq_active
-        if self.vocal_eq_active:
-            self.btn_vocal_eq.setText("🎙️ Vocal Parametric EQ (80-4kHz Cut): ON")
-            self.btn_vocal_eq.setObjectName("eqFilterOn")
-            self.apply_vlc_vocal_eq(True)
-        else:
-            self.btn_vocal_eq.setText("🎙️ Vocal Parametric EQ (80-4kHz Cut): OFF")
-            self.btn_vocal_eq.setObjectName("eqFilterOff")
-            self.apply_vlc_vocal_eq(False)
-        self.btn_vocal_eq.setStyle(self.btn_vocal_eq.style())
+    def check_media_status(self):
+        state = self.media_player.get_state()
+        if state == vlc.State.Ended:
+            if self.chk_autoplay.isChecked():
+                self.play_next()
 
 
 # ==============================================================================
-# 8. APPLICATION ENTRY POINT
+# 8. FLASK WEB SERVER FOR MOBILE CONTROLLER
+# ==============================================================================
+app = Flask(__name__)
+control_win = None
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>KTV Mobile Remote</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 15px; background: #0f172a; color: #fff; margin: 0; }
+        h2, h3 { text-align: center; margin-top: 10px; color: #38bdf8; }
+        input { width: 100%; padding: 12px; box-sizing: border-box; border-radius: 8px; border: 1px solid #334155; background: #1e293b; color: white; font-size: 16px; margin-bottom: 15px; }
+        ul { list-style: none; padding: 0; margin: 0; }
+        li { background: #1e293b; margin-bottom: 8px; padding: 12px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; border: 1px solid #334155; }
+        button { background: #2563eb; color: white; border: none; padding: 8px 14px; border-radius: 6px; font-weight: bold; cursor: pointer; }
+        button:active { background: #1d4ed8; }
+        .queue-item { background: #0f172a; border-left: 4px solid #38bdf8; }
+    </style>
+</head>
+<body>
+    <h2>🎤 KTV Remote</h2>
+
+    <h3>Current Queue</h3>
+    <ul id="queueList"></ul>
+
+    <hr style="border-color: #334155; margin: 20px 0;">
+
+    <h3>Song Library</h3>
+    <input type="text" id="searchInput" onkeyup="filterSongs()" placeholder="Search library...">
+    <ul id="libraryList"></ul>
+
+    <script>
+        let fullLibrary = [];
+
+        function fetchQueue() {
+            fetch('/api/queue')
+                .then(r => r.json())
+                .then(data => {
+                    const list = document.getElementById('queueList');
+                    if (data.queue.length === 0) {
+                        list.innerHTML = '<li style="color:#64748b;">Queue is empty</li>';
+                    } else {
+                        list.innerHTML = data.queue.map((s, i) => `<li class="queue-item"><span>${i+1}. ${s}</span></li>`).join('');
+                    }
+                });
+        }
+
+        function fetchLibrary() {
+            fetch('/api/library')
+                .then(r => r.json())
+                .then(data => {
+                    fullLibrary = data.library;
+                    renderLibrary(fullLibrary);
+                });
+        }
+
+        function renderLibrary(songs) {
+            const list = document.getElementById('libraryList');
+            if (songs.length === 0) {
+                list.innerHTML = '<li style="color:#64748b;">No songs found</li>';
+                return;
+            }
+            list.innerHTML = songs.map(song => `
+                <li>
+                    <span>${song}</span>
+                    <button onclick="addSong('${song.replace(/'/g, "\\'")}')">Add</button>
+                </li>
+            `).join('');
+        }
+
+        function filterSongs() {
+            const query = document.getElementById('searchInput').value.toLowerCase();
+            const filtered = fullLibrary.filter(s => s.toLowerCase().includes(query));
+            renderLibrary(filtered);
+        }
+
+        function addSong(songTitle) {
+            fetch('/api/queue', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ song: songTitle })
+            }).then(() => {
+                fetchQueue();
+            });
+        }
+
+        setInterval(fetchQueue, 3000);
+        fetchQueue();
+        fetchLibrary();
+    </script>
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+
+@app.route("/api/library", methods=["GET"])
+def get_library():
+    if control_win:
+        titles = [s["name"] for s in control_win.song_library]
+        return jsonify({"library": sorted(titles)})
+    return jsonify({"library": []})
+
+
+@app.route("/api/queue", methods=["GET"])
+def get_queue():
+    if control_win:
+        queue_titles = [s["name"] for s in control_win.selected_queue]
+        return jsonify({"queue": queue_titles})
+    return jsonify({"queue": []})
+
+
+@app.route("/api/queue", methods=["POST"])
+def post_queue():
+    data = request.get_json()
+    song_name = data.get("song")
+
+    if song_name and control_win:
+        matched_song = next(
+            (s for s in control_win.song_library if s["name"] == song_name), None
+        )
+        if matched_song:
+            control_win.web_song_added.emit(matched_song)
+            return jsonify({"status": "success", "song": song_name}), 200
+
+    return jsonify({"status": "error", "message": "Song not found"}), 400
+
+
+def start_flask_server():
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+
+
+# ==============================================================================
+# 9. APPLICATION ENTRY POINT
 # ==============================================================================
 def main():
-    app = QApplication(sys.argv)
+    global control_win
+    qapp = QApplication(sys.argv)
 
     display_win = VideoDisplayWindow()
     control_win = KTVControlWindow(display_win)
 
+    server_thread = threading.Thread(target=start_flask_server, daemon=True)
+    server_thread.start()
+
     display_win.show()
     control_win.show()
 
-    sys.exit(app.exec())
+    sys.exit(qapp.exec())
 
 
 if __name__ == "__main__":
