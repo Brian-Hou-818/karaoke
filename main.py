@@ -10,7 +10,7 @@ import numpy as np
 from scipy.signal import butter, iirnotch, sosfilt
 
 # ==============================================================================
-# 1. WINDOWS DLL PATCH & SETUP FOR PYTHON-VLC
+# 1. WINDOWS / LINUX DLL PATCH & SETUP FOR PYTHON-VLC
 # ==============================================================================
 VLC_PATH = r"C:\Program Files\VideoLAN\VLC"
 
@@ -102,8 +102,9 @@ def apply_parametric_vocal_eq(audio_data, sample_rate=44100):
 class AudioPassthroughStream:
     """ Ultra-low latency audio stream with optimized feedback echo/reverb DSP """
 
-    def __init__(self, device_id, sample_rate=44100):
-        self.device_id = device_id
+    def __init__(self, input_device_id, output_device_id=None, sample_rate=44100):
+        self.input_device_id = input_device_id
+        self.output_device_id = output_device_id
         self.sample_rate = sample_rate
         self.volume = 1.0
 
@@ -149,28 +150,28 @@ class AudioPassthroughStream:
         if self.is_running:
             return
         try:
-            dev_info = sd.query_devices(self.device_id)
+            dev_info = sd.query_devices(self.input_device_id)
             channels = min(dev_info['max_input_channels'], 2)
 
+            device_tuple = (self.input_device_id, self.output_device_id)
+
             # --- LOW-LATENCY OPTIMIZATIONS ---
-            # 1. blocksize=64 (or 128) dramatically reduces buffer delay (from ~6ms down to ~1.4ms)
-            # 2. latency='low' hints the OS audio driver (WASAPI/ASIO) to minimize buffer sizes
             self.stream = sd.Stream(
-                device=(self.device_id, None),
+                device=device_tuple,
                 samplerate=self.sample_rate,
-                blocksize=64,  # Reduced from 256 for near-instant response
-                latency='low',  # Forces WASAPI/ASIO low latency mode
+                blocksize=64,
+                latency='low',
                 channels=channels,
                 dtype='float32',
                 callback=self._audio_callback
             )
             self.stream.start()
             self.is_running = True
-        except Exception as e:
-            # Fallback to blocksize=128 if 64 causes buffer under-runs on older audio hardware
+        except Exception:
             try:
+                device_tuple = (self.input_device_id, self.output_device_id)
                 self.stream = sd.Stream(
-                    device=(self.device_id, None),
+                    device=device_tuple,
                     samplerate=self.sample_rate,
                     blocksize=128,
                     latency='low',
@@ -240,13 +241,11 @@ class VideoDisplayWindow(QWidget):
         layout.addWidget(self.video_frame)
 
     def keyPressEvent(self, event: QKeyEvent):
-        # Toggle fullscreen with 'F'
         if event.key() == Qt.Key.Key_F:
             if self.isFullScreen():
                 self.showNormal()
             else:
                 self.showFullScreen()
-        # Skip song with 'N' or 'Right Arrow' or Media Next key
         elif event.key() in (Qt.Key.Key_N, Qt.Key.Key_Right, Qt.Key.Key_MediaNext):
             if self.skip_callback:
                 self.skip_callback()
@@ -269,7 +268,7 @@ class KTVControlWindow(QMainWindow):
         self.display_win.skip_callback = self.play_next
 
         self.setWindowTitle("KTV Control Panel")
-        self.setGeometry(80, 80, 950, 900)
+        self.setGeometry(80, 80, 950, 950)
 
         # Default Library Directory to Downloads folder
         self.current_folder = str(Path.home() / "Downloads")
@@ -285,7 +284,7 @@ class KTVControlWindow(QMainWindow):
         self.mic2_stream = None
 
         # VLC Engine
-        self.vlc_instance = vlc.Instance('--aout=directsound')
+        self.vlc_instance = vlc.Instance('--aout=directsound' if sys.platform.startswith('win') else '')
         self.media_player = self.vlc_instance.media_player_new()
 
         # Polling Timer for Autoplay / Media End Detection
@@ -296,24 +295,21 @@ class KTVControlWindow(QMainWindow):
 
         self.init_ui()
         self.setup_shortcuts()
-        self.populate_mic_devices()
+        self.populate_audio_devices()
 
         # Initial scan of Downloads directory
         self.scan_folder_for_songs(self.current_folder)
 
     def setup_shortcuts(self):
         """ Configures hotkeys to skip songs from the control window """
-        # Shortcut 'N' or 'Ctrl+N'
         self.shortcut_n = QShortcut(QKeySequence("N"), self)
         self.shortcut_n.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self.shortcut_n.activated.connect(self.play_next)
 
-        # Shortcut 'Ctrl+Right'
         self.shortcut_ctrl_right = QShortcut(QKeySequence("Ctrl+Right"), self)
         self.shortcut_ctrl_right.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self.shortcut_ctrl_right.activated.connect(self.play_next)
 
-        # Dedicated Media Key 'MediaNext'
         self.shortcut_media_next = QShortcut(QKeySequence(Qt.Key.Key_MediaNext), self)
         self.shortcut_media_next.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self.shortcut_media_next.activated.connect(self.play_next)
@@ -431,6 +427,20 @@ class KTVControlWindow(QMainWindow):
         # ------------------------------------------------------------------------------
         left_col = QVBoxLayout()
         left_col.setSpacing(12)
+
+        # 0. HARDWARE AUDIO OUTPUT SELECTION CARD
+        out_box = QGroupBox("🔊 Output Hardware Device")
+        out_layout = QVBoxLayout(out_box)
+        out_layout.setSpacing(10)
+
+        out_dev_row = QHBoxLayout()
+        out_dev_row.addWidget(QLabel("<b>Output:</b>"))
+        self.output_combo = QComboBox()
+        self.output_combo.currentIndexChanged.connect(self.on_output_device_changed)
+        out_dev_row.addWidget(self.output_combo, stretch=1)
+        out_layout.addLayout(out_dev_row)
+
+        left_col.addWidget(out_box)
 
         # 1. MUSIC PLAYBACK CARD
         music_box = QGroupBox("🎵 Music Playback & Audio Control")
@@ -629,19 +639,132 @@ class KTVControlWindow(QMainWindow):
         else:
             self.display_win.showFullScreen()
 
-    def populate_mic_devices(self):
+    def populate_audio_devices(self):
+        """ Populate input (mics) and output (speakers) hardware devices """
         self.mic1_combo.clear()
         self.mic2_combo.clear()
+        self.output_combo.clear()
+
         devices = sd.query_devices()
+        default_out_idx = sd.default.device[1]
 
         for idx, dev in enumerate(devices):
+            # Input devices
             if dev['max_input_channels'] > 0:
                 name = f"[{idx}] {dev['name']}"
                 self.mic1_combo.addItem(name, userData=idx)
                 self.mic2_combo.addItem(name, userData=idx)
 
+            # Output devices
+            if dev['max_output_channels'] > 0:
+                name = f"[{idx}] {dev['name']}"
+                self.output_combo.addItem(name, userData=idx)
+
         if self.mic2_combo.count() > 1:
             self.mic2_combo.setCurrentIndex(1)
+
+        # Select default system output device in combo box
+        for i in range(self.output_combo.count()):
+            if self.output_combo.itemData(i) == default_out_idx:
+                self.output_combo.setCurrentIndex(i)
+                break
+
+    def get_selected_output_device_id(self):
+        return self.output_combo.currentData()
+
+    def on_output_device_changed(self):
+        out_id = self.get_selected_output_device_id()
+
+        # Update Mic 1
+        if self.mic1_stream and self.mic1_stream.is_running:
+            self.mic1_stream.stop()
+            self.mic1_stream = AudioPassthroughStream(self.mic1_stream.input_device_id, out_id)
+            self.mic1_stream.start()
+
+        # Update Mic 2
+        if self.mic2_stream and self.mic2_stream.is_running:
+            self.mic2_stream.stop()
+            self.mic2_stream = AudioPassthroughStream(self.mic2_stream.input_device_id, out_id)
+            self.mic2_stream.start()
+
+        self.update_mic_settings()
+        self.sync_vlc_output_device()
+
+    def sync_vlc_output_device(self):
+        """ Syncs VLC audio output with the selected sounddevice output """
+        out_id = self.get_selected_output_device_id()
+        if out_id is None:
+            return
+
+        target_name = sd.query_devices(out_id)['name']
+
+        # Enumerate VLC audio outputs to find matching device
+        device_enum = self.media_player.audio_output_device_enum()
+        if device_enum:
+            curr = device_enum
+            while curr:
+                dev_id = curr.contents.device
+                dev_desc = curr.contents.description.decode('utf-8', errors='ignore') if curr.contents.description else ""
+                if target_name.lower() in dev_desc.lower() or dev_desc.lower() in target_name.lower():
+                    self.media_player.audio_output_device_set(None, dev_id)
+                    break
+                curr = curr.contents.next
+
+            # FIX: Correct method name in python-vlc for releasing device list
+            vlc.libvlc_audio_output_device_list_release(device_enum)
+
+    def toggle_mic1(self):
+        if self.mic1_stream and self.mic1_stream.is_running:
+            self.mic1_stream.stop()
+            self.mic1_stream = None
+            self.btn_mic1_toggle.setText("Mic 1 OFF")
+            self.btn_mic1_toggle.setObjectName("micBtnOff")
+        else:
+            dev_id = self.mic1_combo.currentData()
+            out_id = self.get_selected_output_device_id()
+            if dev_id is not None:
+                self.mic1_stream = AudioPassthroughStream(dev_id, out_id)
+                self.mic1_stream.start()
+                self.btn_mic1_toggle.setText("Mic 1 ON")
+                self.btn_mic1_toggle.setObjectName("micBtnOn")
+        self.btn_mic1_toggle.setStyle(self.btn_mic1_toggle.style())
+        self.update_mic_settings()
+
+    def toggle_mic2(self):
+        if self.mic2_stream and self.mic2_stream.is_running:
+            self.mic2_stream.stop()
+            self.mic2_stream = None
+            self.btn_mic2_toggle.setText("Mic 2 OFF")
+            self.btn_mic2_toggle.setObjectName("micBtnOff")
+        else:
+            dev_id = self.mic2_combo.currentData()
+            out_id = self.get_selected_output_device_id()
+            if dev_id is not None:
+                self.mic2_stream = AudioPassthroughStream(dev_id, out_id)
+                self.mic2_stream.start()
+                self.btn_mic2_toggle.setText("Mic 2 ON")
+                self.btn_mic2_toggle.setObjectName("micBtnOn")
+        self.btn_mic2_toggle.setStyle(self.btn_mic2_toggle.style())
+        self.update_mic_settings()
+
+    def update_mic_settings(self):
+        m1_vol = self.mic1_vol_slider.value() / 100.0
+        m2_vol = self.mic2_vol_slider.value() / 100.0
+        delay_ms = self.echo_delay_slider.value()
+        feedback = self.echo_decay_slider.value() / 100.0
+
+        self.mic1_vol_label.setText(f"{self.mic1_vol_slider.value()}%")
+        self.mic2_vol_label.setText(f"{self.mic2_vol_slider.value()}%")
+        self.echo_delay_label.setText(f"{delay_ms}ms")
+        self.echo_decay_label.setText(f"{self.echo_decay_slider.value()}%")
+
+        if self.mic1_stream:
+            self.mic1_stream.set_volume(m1_vol)
+            self.mic1_stream.set_echo_params(delay_ms, feedback)
+
+        if self.mic2_stream:
+            self.mic2_stream.set_volume(m2_vol)
+            self.mic2_stream.set_echo_params(delay_ms, feedback)
 
     def scan_folder_for_songs(self, folder_path):
         if not os.path.exists(folder_path):
@@ -700,7 +823,7 @@ class KTVControlWindow(QMainWindow):
 
     def remove_from_queue(self):
         selected_row = self.queue_widget.currentRow()
-        if selected_row >= 0 and selected_row < len(self.selected_queue):
+        if 0 <= selected_row < len(self.selected_queue):
             del self.selected_queue[selected_row]
             self.refresh_queue_widget()
 
@@ -743,14 +866,17 @@ class KTVControlWindow(QMainWindow):
         media = self.vlc_instance.media_new(self.current_song['path'])
         self.media_player.set_media(media)
 
+        # Cross-platform window embedding
         if sys.platform.startswith('win'):
             self.media_player.set_hwnd(int(self.display_win.video_frame.winId()))
+        else:
+            self.media_player.set_xwindow(int(self.display_win.video_frame.winId()))
 
         self.media_player.play()
+        self.sync_vlc_output_device()
         self.media_player.audio_set_volume(self.music_vol_slider.value())
         self.btn_play_pause.setText("⏸ Pause")
 
-        # Re-apply active EQ settings to newly loaded track
         if self.vocal_eq_active:
             self.apply_vlc_vocal_eq(True)
 
@@ -779,6 +905,27 @@ class KTVControlWindow(QMainWindow):
         self.media_player.audio_set_volume(value)
         self.music_vol_label.setText(f"{value}%")
 
+    def set_audio_channel(self, mode):
+        if mode == "left":
+            self.media_player.audio_set_channel(3)  # Left channel
+        elif mode == "right":
+            self.media_player.audio_set_channel(4)  # Right channel
+        else:
+            self.media_player.audio_set_channel(1)  # Stereo
+
+    def apply_vlc_vocal_eq(self, enable):
+        if enable:
+            eq = vlc.AudioEqualizer()
+            # Scoop vocal frequencies in VLC's standard 10-band equalizer
+            eq.set_amp_at_index(-15.0, 3)  # 250 Hz
+            eq.set_amp_at_index(-18.0, 4)  # 500 Hz
+            eq.set_amp_at_index(-18.0, 5)  # 1 kHz
+            eq.set_amp_at_index(-15.0, 6)  # 2 kHz
+            eq.set_amp_at_index(-12.0, 7)  # 4 kHz
+            self.media_player.set_equalizer(eq)
+        else:
+            self.media_player.set_equalizer(None)
+
     def toggle_vocal_eq(self):
         self.vocal_eq_active = not self.vocal_eq_active
         if self.vocal_eq_active:
@@ -791,113 +938,21 @@ class KTVControlWindow(QMainWindow):
             self.apply_vlc_vocal_eq(False)
         self.btn_vocal_eq.setStyle(self.btn_vocal_eq.style())
 
-    def apply_vlc_vocal_eq(self, enable: bool):
-        """ Configures VLC's 10-band equalizer to scoop out vocal frequencies """
-        if enable:
-            eq = vlc.AudioEqualizer()
-            # 10 VLC EQ Frequency Bands: [60Hz, 170Hz, 310Hz, 600Hz, 1kHz, 3kHz, 6kHz, 12kHz, 14kHz, 16kHz]
-
-            # High pass & Low pass cut limits (-20 dB)
-            eq.set_amp_at_index(-18.0, 0)  # 60 Hz  (HPF Rumble cut)
-            eq.set_amp_at_index(-20.0, 1)  # 170 Hz (Vocal Fundamental cut)
-            eq.set_amp_at_index(-24.0, 2)  # 310 Hz (Core Vocal Formant scoop)
-            eq.set_amp_at_index(-24.0, 3)  # 600 Hz (Core Vocal Formant scoop)
-            eq.set_amp_at_index(-20.0, 4)  # 1 kHz  (Vocal Presence scoop)
-            eq.set_amp_at_index(-16.0, 5)  # 3 kHz  (Vocal Clarity scoop)
-
-            # Pass instrumentals at 6kHz and above
-            eq.set_amp_at_index(-10.0, 6)  # 6 kHz  (LPF Sibilance reduction)
-            eq.set_amp_at_index(0.0, 7)  # 12 kHz (Treble)
-            eq.set_amp_at_index(0.0, 8)  # 14 kHz (Treble)
-            eq.set_amp_at_index(0.0, 9)  # 16 kHz (Air)
-
-            self.media_player.set_equalizer(eq)
-        else:
-            # Disable Equalizer (Reset to flat)
-            self.media_player.set_equalizer(None)
-
-    def toggle_mic1(self):
-        dev_id = self.mic1_combo.currentData()
-        if dev_id is None:
-            return
-
-        if self.mic1_stream and self.mic1_stream.is_running:
-            self.mic1_stream.stop()
-            self.btn_mic1_toggle.setText("Mic 1 OFF")
-            self.btn_mic1_toggle.setObjectName("micBtnOff")
-            self.btn_mic1_toggle.setStyle(self.btn_mic1_toggle.style())
-        else:
-            self.mic1_stream = AudioPassthroughStream(dev_id)
-            self.update_mic_settings()
-            self.mic1_stream.start()
-            self.btn_mic1_toggle.setText("Mic 1 ON")
-            self.btn_mic1_toggle.setObjectName("micBtnOn")
-            self.btn_mic1_toggle.setStyle(self.btn_mic1_toggle.style())
-
-    def toggle_mic2(self):
-        dev_id = self.mic2_combo.currentData()
-        if dev_id is None:
-            return
-
-        if self.mic2_stream and self.mic2_stream.is_running:
-            self.mic2_stream.stop()
-            self.btn_mic2_toggle.setText("Mic 2 OFF")
-            self.btn_mic2_toggle.setObjectName("micBtnOff")
-            self.btn_mic2_toggle.setStyle(self.btn_mic2_toggle.style())
-        else:
-            self.mic2_stream = AudioPassthroughStream(dev_id)
-            self.update_mic_settings()
-            self.mic2_stream.start()
-            self.btn_mic2_toggle.setText("Mic 2 ON")
-            self.btn_mic2_toggle.setObjectName("micBtnOn")
-            self.btn_mic2_toggle.setStyle(self.btn_mic2_toggle.style())
-
-    def update_mic_settings(self):
-        m1_vol = self.mic1_vol_slider.value()
-        m2_vol = self.mic2_vol_slider.value()
-        delay = self.echo_delay_slider.value()
-        decay = self.echo_decay_slider.value() / 100.0
-
-        self.mic1_vol_label.setText(f"{m1_vol}%")
-        self.mic2_vol_label.setText(f"{m2_vol}%")
-        self.echo_delay_label.setText(f"{delay}ms")
-        self.echo_decay_label.setText(f"{int(decay * 100)}%")
-
-        if self.mic1_stream:
-            self.mic1_stream.set_volume(m1_vol / 100.0)
-            self.mic1_stream.set_echo_params(delay, decay)
-
-        if self.mic2_stream:
-            self.mic2_stream.set_volume(m2_vol / 100.0)
-            self.mic2_stream.set_echo_params(delay, decay)
-
-    def set_audio_channel(self, mode):
-        if mode == "stereo":
-            self.media_player.audio_set_channel(1)  # Stereo
-        elif mode == "left":
-            self.media_player.audio_set_channel(3)  # Left Channel (KTV Instrumental)
-        elif mode == "right":
-            self.media_player.audio_set_channel(4)  # Right Channel (KTV Vocal)
-
-    def closeEvent(self, event):
-        if self.mic1_stream:
-            self.mic1_stream.stop()
-        if self.mic2_stream:
-            self.mic2_stream.stop()
-        self.display_win.close()
-        event.accept()
-
 
 # ==============================================================================
-# 8. MAIN ENTRY POINT
+# 8. APPLICATION ENTRY POINT
 # ==============================================================================
-if __name__ == "__main__":
+def main():
     app = QApplication(sys.argv)
 
     display_win = VideoDisplayWindow()
-    display_win.show()
-
     control_win = KTVControlWindow(display_win)
+
+    display_win.show()
     control_win.show()
 
     sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
