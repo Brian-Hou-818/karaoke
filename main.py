@@ -1,55 +1,27 @@
 import ctypes
 import os
+
+os.environ['SDL_AUDIODRIVER'] = 'pulseaudio'
+os.environ['ALSOFT_DRIVERS'] = 'pulse'
+
 import random
 import sys
 import threading
 from pathlib import Path
-from queue import Queue
 
-# Ensure Qt uses X11 (xcb) on Linux to support VLC window embedding
-if not sys.platform.startswith("win"):
-    os.environ["QT_QPA_PLATFORM"] = "xcb"
+# Force PulseAudio/ALSA virtual plugin layers before sounddevice loads
+os.environ["PA_ALSA_PLUGHW"] = "1"
+os.environ["PORTAUDIO_DISABLE_JACK"] = "1"
+# Force Qt to use X11/XCB on Linux for proper VLC video embedding
+os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 from flask import Flask, jsonify, render_template_string, request
+from flask_socketio import SocketIO, emit
 import numpy as np
-
-# SciPy DSP for Parametric EQ calculation
-from scipy.signal import butter, iirnotch, sosfilt
 import sounddevice as sd
-
-# ==============================================================================
-# 1. WINDOWS / LINUX DLL PATCH & SETUP FOR PYTHON-VLC
-# ==============================================================================
-VLC_PATH = r"C:\Program Files\VideoLAN\VLC"
-
-if os.path.exists(VLC_PATH):
-    os.add_dll_directory(VLC_PATH)
-    os.environ["PATH"] = VLC_PATH + os.pathsep + os.environ["PATH"]
-    os.environ["PYTHON_VLC_MODULE_PATH"] = VLC_PATH
-
-_orig_cdll_init = ctypes.CDLL.__init__
-
-
-def _patched_cdll_init(self, name, *args, **kwargs):
-    if isinstance(name, str) and ("libvlc" in name or name.startswith(".\\")):
-        dll_name = os.path.basename(name)
-        abs_vlc_path = os.path.join(VLC_PATH, dll_name)
-        if os.path.exists(abs_vlc_path):
-            name = abs_vlc_path
-        kwargs["winmode"] = 0
-    _orig_cdll_init(self, name, *args, **kwargs)
-
-
-ctypes.CDLL.__init__ = _patched_cdll_init
-
 import vlc
 
-ctypes.CDLL.__init__ = _orig_cdll_init
-
-# ==============================================================================
-# 2. APPLICATION IMPORTS
-# ==============================================================================
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QKeyEvent, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -58,7 +30,6 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
-    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -66,65 +37,42 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QProgressBar,
     QPushButton,
     QSlider,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 
-def get_truncated_title(title, max_length=10):
+def get_truncated_title(title, max_length=40):
     if len(title) > max_length:
         return title[: max_length - 3] + "..."
     return title
 
 
 # ==============================================================================
-# 3. DSP PARAMETRIC EQUALIZER FUNCTION
+# QT SIGNAL EMITTER FOR THREAD-SAFE MIC LEVEL UPDATES
 # ==============================================================================
-def apply_parametric_vocal_eq(audio_data, sample_rate=44100):
-    if audio_data.size == 0:
-        return audio_data
-
-    processed = audio_data.copy()
-
-    # 1. High-Pass Filter (< 100 Hz cut)
-    hp_sos = butter(2, 100, btype="highpass", fs=sample_rate, output="sos")
-    processed = sosfilt(hp_sos, processed, axis=0)
-
-    # 2. Low-Pass Filter (> 8,000 Hz cut)
-    lp_sos = butter(2, 8000, btype="lowpass", fs=sample_rate, output="sos")
-    processed = sosfilt(lp_sos, processed, axis=0)
-
-    # 3. Parametric Vocal Notch Band Cuts (80 Hz - 4,000 Hz core vocal range)
-    vocal_center_frequencies = [250, 800, 1500, 3000]
-    wide_q_factor = 0.85
-
-    for freq in vocal_center_frequencies:
-        b, a = iirnotch(freq, wide_q_factor, fs=sample_rate)
-        if processed.ndim > 1:
-            for ch in range(processed.shape[1]):
-                processed[:, ch] = np.convolve(
-                    processed[:, ch], b, mode="same"
-                )
-        else:
-            processed = np.convolve(processed, b, mode="same")
-
-    return np.clip(processed * 0.3, -1.0, 1.0)
+class MicLevelEmitter(QObject):
+    # Sends: volume_percent (0-100), is_clipping (bool)
+    level_signal = pyqtSignal(int, bool)
 
 
 # ==============================================================================
-# 4. LOW-LATENCY SOFTWARE AUDIO STREAM WITH ECHO / REVERB DSP
+# LOW-LATENCY SOFTWARE AUDIO STREAM WITH ECHO / REVERB DSP & LIVE FEEDBACK
 # ==============================================================================
 class AudioPassthroughStream:
+
     def __init__(self, input_device_id, output_device_id=None, sample_rate=44100):
         self.input_device_id = input_device_id
         self.output_device_id = output_device_id
         self.sample_rate = sample_rate
-        self.volume = 1.0
+        self.volume = 0.8  # Default conservative gain to avoid overdrive
 
         self.echo_delay_ms = 180
-        self.echo_feedback = 0.4
+        self.echo_feedback = 0.25  # Controlled default echo decay
 
         self.buffer_size = sample_rate * 2
         self.delay_buffer = np.zeros((self.buffer_size, 2), dtype=np.float32)
@@ -133,73 +81,129 @@ class AudioPassthroughStream:
         self.is_running = False
         self.stream = None
 
+        # Counter for GUI signal throttling
+        self._frame_counter = 0
+
+        # Live level feedback signal emitter
+        self.emitter = MicLevelEmitter()
+
     def _audio_callback(self, indata, outdata, frames, time, status):
-        out_channels = outdata.shape[1]
+        if status:
+            print(f"[Mic Buffer Warning] {status}", sys.stderr)
 
-        if indata.shape[1] == 1 and out_channels == 2:
-            in_samples = np.column_stack((indata[:, 0], indata[:, 0]))
-        else:
-            in_samples = indata[:, :out_channels]
+        try:
+            # --- Live Level Feedback Calculation & Throttle ---
+            rms = np.sqrt(np.mean(indata ** 2))
+            peak = np.max(np.abs(indata))
+            vol_percent = int(min(1.0, rms * 6.0) * 100)
 
-        processed = in_samples * self.volume
+            # FIX 1: Explicit python bool cast to satisfy PyQt signal type check
+            is_clipping = bool(peak > 0.92)
 
-        delay_samples = int((self.echo_delay_ms / 1000.0) * self.sample_rate)
-        read_indices = (
-            np.arange(self.write_pos, self.write_pos + frames) - delay_samples
-        ) % self.buffer_size
-        write_indices = (
-            np.arange(self.write_pos, self.write_pos + frames)
-        ) % self.buffer_size
+            # Throttle signal to prevent Qt thread GUI queue flooding (~30ms rate)
+            self._frame_counter += 1
+            if self._frame_counter % 10 == 0:
+                self.emitter.level_signal.emit(vol_percent, is_clipping)
+                self._frame_counter = 0
 
-        delayed_samples = self.delay_buffer[read_indices, :out_channels]
-        mixed_samples = processed + (delayed_samples * self.echo_feedback)
+            # --- DSP Pass-through & Echo Logic ---
+            in_chans = indata.shape[1]
+            out_chans = outdata.shape[1]
 
-        self.delay_buffer[write_indices, :out_channels] = mixed_samples
-        self.write_pos = (self.write_pos + frames) % self.buffer_size
+            if in_chans == 1 and out_chans >= 2:
+                in_samples = np.column_stack((indata[:, 0], indata[:, 0]))
+            else:
+                in_samples = indata[:, : min(in_chans, out_chans)]
 
-        outdata[:] = np.clip(mixed_samples, -1.0, 1.0)
+            # Soft headroom clamp on input gain to prevent harsh clipping
+            processed = np.clip(in_samples * self.volume, -0.9, 0.9)
+
+            delay_samples = int((self.echo_delay_ms / 1000.0) * self.sample_rate)
+            read_indices = (
+                                   np.arange(self.write_pos, self.write_pos + frames) - delay_samples
+                           ) % self.buffer_size
+            write_indices = (
+                                np.arange(self.write_pos, self.write_pos + frames)
+                            ) % self.buffer_size
+
+            delayed_samples = self.delay_buffer[
+                read_indices, : processed.shape[1]
+            ]
+
+            # Mix input signal with echo delay tail
+            mixed_samples = processed + (delayed_samples * self.echo_feedback)
+
+            # FIX 2: Multiply delay write-back by 0.95 safety factor to curb runaway feedback loops
+            self.delay_buffer[
+                write_indices, : processed.shape[1]
+            ] = mixed_samples * 0.95
+            self.write_pos = (self.write_pos + frames) % self.buffer_size
+
+            outdata.fill(0)
+            # FIX 2 (cont): Smooth hyperbolic tangent saturation to eliminate audio cracking & distortion
+            outdata[:, : mixed_samples.shape[1]] = np.tanh(mixed_samples)
+        except Exception as e:
+            # Silence buffer output and prevent PortAudio thread crash
+            outdata.fill(0)
+            print(f"[Callback DSP Error] {e}", sys.stderr)
 
     def start(self):
         if self.is_running:
             return
         try:
-            dev_info = sd.query_devices(self.input_device_id)
-            channels = min(dev_info["max_input_channels"], 2)
+            target_in = (
+                self.input_device_id
+                if self.input_device_id is not None
+                else sd.default.device[0]
+            )
+            target_out = (
+                self.output_device_id
+                if self.output_device_id is not None
+                else sd.default.device[1]
+            )
 
-            device_tuple = (self.input_device_id, self.output_device_id)
+            # Safely query device capabilities
+            in_info = sd.query_devices(target_in, "input")
+            out_info = sd.query_devices(target_out, "output")
+
+            in_ch = max(1, min(1, int(in_info.get("max_input_channels", 1))))
+            out_ch = max(1, min(2, int(out_info.get("max_output_channels", 2))))
+
+            srate = int(in_info.get("default_samplerate", 44100))
+            if srate <= 0:
+                srate = 44100
+            self.sample_rate = srate
+
+            self.buffer_size = self.sample_rate * 2
+            self.delay_buffer = np.zeros((self.buffer_size, 2), dtype=np.float32)
 
             self.stream = sd.Stream(
-                device=device_tuple,
+                device=(target_in, target_out),
                 samplerate=self.sample_rate,
-                blocksize=64,
-                latency="low",
-                channels=channels,
+                blocksize=128,  # Low-latency buffer
+                channels=(in_ch, out_ch),
                 dtype="float32",
                 callback=self._audio_callback,
             )
             self.stream.start()
             self.is_running = True
-        except Exception:
-            try:
-                device_tuple = (self.input_device_id, self.output_device_id)
-                self.stream = sd.Stream(
-                    device=device_tuple,
-                    samplerate=self.sample_rate,
-                    blocksize=128,
-                    latency="low",
-                    channels=channels,
-                    dtype="float32",
-                    callback=self._audio_callback,
-                )
-                self.stream.start()
-                self.is_running = True
-            except Exception as inner_e:
-                print(f"Failed to start low-latency mic stream: {inner_e}")
+            print(
+                f"[Audio Stream] Linux stream active: Mic #{target_in} -> Speaker #{target_out} @ {srate}Hz"
+            )
+        except Exception as e:
+            print(
+                f"[AudioPassthroughStream Error] Could not start Linux stream: {e}",
+                sys.stderr,
+            )
+            self.is_running = False
 
     def stop(self):
         if self.stream:
-            self.stream.stop()
-            self.stream.close()
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception as e:
+                print(f"[Audio Stream Close Error] {e}", sys.stderr)
             self.stream = None
         self.is_running = False
 
@@ -212,9 +216,10 @@ class AudioPassthroughStream:
 
 
 # ==============================================================================
-# 5. DRAG AND DROP QUEUE WIDGET
+# DRAG AND DROP QUEUE WIDGET
 # ==============================================================================
 class DraggableQueueList(QListWidget):
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setDragEnabled(True)
@@ -231,9 +236,10 @@ class DraggableQueueList(QListWidget):
 
 
 # ==============================================================================
-# 6. DEDICATED SECONDARY VIDEO DISPLAY WINDOW
+# SECONDARY VIDEO DISPLAY WINDOW
 # ==============================================================================
 class VideoDisplayWindow(QWidget):
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("KTV Video Display")
@@ -255,9 +261,9 @@ class VideoDisplayWindow(QWidget):
             else:
                 self.showFullScreen()
         elif event.key() in (
-            Qt.Key.Key_N,
-            Qt.Key.Key_Right,
-            Qt.Key.Key_MediaNext,
+                Qt.Key.Key_N,
+                Qt.Key.Key_Right,
+                Qt.Key.Key_MediaNext,
         ):
             if self.skip_callback:
                 self.skip_callback()
@@ -271,11 +277,10 @@ class VideoDisplayWindow(QWidget):
 
 
 # ==============================================================================
-# 7. MAIN KTV CONTROL WINDOW
+# MAIN KTV CONTROL WINDOW
 # ==============================================================================
 class KTVControlWindow(QMainWindow):
-    # Qt Signals for thread-safe UI updates from Flask remote
-    web_song_added = pyqtSignal(dict)
+    web_song_added = pyqtSignal(dict, bool)
     web_action_triggered = pyqtSignal(str)
 
     def __init__(self, display_window):
@@ -283,37 +288,42 @@ class KTVControlWindow(QMainWindow):
         self.display_win = display_window
         self.display_win.skip_callback = self.play_next
 
-        self.setWindowTitle("KTV Control Panel")
-        self.setGeometry(80, 80, 950, 950)
+        self.setWindowTitle("KTV Control Panel (Linux)")
+        self.setGeometry(80, 80, 1000, 950)
 
         self.current_folder = str(Path.home() / "Downloads")
 
         self.song_library = []
         self.selected_queue = []
         self.current_song = None
-        self.vocal_eq_active = False
+
+        self.vocal_mode = "both"
+        self.playback_rate = 1.0
 
         self.mic1_stream = None
         self.mic2_stream = None
 
-        self.vlc_instance = vlc.Instance(
-            "--aout=directsound" if sys.platform.startswith("win") else ""
-        )
+        # Route VLC audio output through PulseAudio daemon
+        vlc_flags = [
+            "--no-xlib",
+            "--aout=pulse",
+            "--role=music",
+            "--alsa-audio-device=default",
+        ]
+        self.vlc_instance = vlc.Instance(" ".join(vlc_flags))
+        if self.vlc_instance is None:
+            raise RuntimeError("Failed to initialize libVLC instance.")
+
         self.media_player = self.vlc_instance.media_player_new()
 
-        # Connect VLC video output to VideoDisplayWindow frame
         window_handle = int(self.display_win.video_frame.winId())
-        if sys.platform.startswith("win"):
-            self.media_player.set_hwnd(window_handle)
-        else:
-            self.media_player.set_xwindow(window_handle)
+        self.media_player.set_xwindow(window_handle)
 
         self.poll_timer = QTimer(self)
-        self.poll_timer.setInterval(500)
+        self.poll_timer.setInterval(300)
         self.poll_timer.timeout.connect(self.check_media_status)
         self.poll_timer.start()
 
-        # Connect thread signals from Web Remote
         self.web_song_added.connect(self.add_song_to_queue)
         self.web_action_triggered.connect(self.handle_web_action)
 
@@ -327,22 +337,6 @@ class KTVControlWindow(QMainWindow):
         self.shortcut_n = QShortcut(QKeySequence("N"), self)
         self.shortcut_n.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self.shortcut_n.activated.connect(self.play_next)
-
-        self.shortcut_ctrl_right = QShortcut(
-            QKeySequence("Ctrl+Right"), self
-        )
-        self.shortcut_ctrl_right.setContext(
-            Qt.ShortcutContext.ApplicationShortcut
-        )
-        self.shortcut_ctrl_right.activated.connect(self.play_next)
-
-        self.shortcut_media_next = QShortcut(
-            QKeySequence(Qt.Key.Key_MediaNext), self
-        )
-        self.shortcut_media_next.setContext(
-            Qt.ShortcutContext.ApplicationShortcut
-        )
-        self.shortcut_media_next.activated.connect(self.play_next)
 
     def init_ui(self):
         self.setStyleSheet("""
@@ -366,67 +360,41 @@ class KTVControlWindow(QMainWindow):
             QComboBox { 
                 background-color: #0f172a; color: white; 
                 border: 1px solid #334155; border-radius: 6px; padding: 6px;
-                font-size: 12px;
             }
             QLineEdit { 
                 background-color: #1e293b; color: white; 
-                border: 1px solid #334155; border-radius: 6px; 
-                padding: 8px; font-size: 13px;
+                border: 1px solid #334155; border-radius: 6px; padding: 8px;
             }
             QListWidget { 
                 background-color: #1e293b; color: #f8fafc; 
                 border: 1px solid #334155; border-radius: 8px; padding: 4px;
-                font-size: 13px;
             }
             QListWidget::item { padding: 10px; border-bottom: 1px solid #334155; }
             QListWidget::item:hover { background-color: #334155; }
             QListWidget::item:selected { background-color: #2563eb; border-radius: 4px; }
             QPushButton { 
                 background-color: #334155; color: white; border: none; 
-                padding: 8px 14px; border-radius: 6px; font-weight: bold; font-size: 13px;
+                padding: 8px 14px; border-radius: 6px; font-weight: bold;
             }
             QPushButton:hover { background-color: #475569; }
             QPushButton#primaryBtn { background-color: #2563eb; }
             QPushButton#primaryBtn:hover { background-color: #1d4ed8; }
-            QPushButton#refreshBtn { background-color: #0284c7; }
-            QPushButton#refreshBtn:hover { background-color: #0369a1; }
-            QPushButton#playBtn { background-color: #16a34a; min-width: 90px; }
-            QPushButton#playBtn:hover { background-color: #15803d; }
-            QPushButton#micBtnOff { background-color: #dc2626; min-width: 90px; }
-            QPushButton#micBtnOff:hover { background-color: #b91c1c; }
-            QPushButton#micBtnOn { background-color: #16a34a; min-width: 90px; }
-            QPushButton#micBtnOn:hover { background-color: #15803d; }
-            QPushButton#eqFilterOff { background-color: #475569; }
-            QPushButton#eqFilterOn { background-color: #059669; }
-            QPushButton#eqFilterOn:hover { background-color: #047857; }
-            QCheckBox { color: #f8fafc; font-weight: bold; font-size: 12px; }
-            QCheckBox::indicator { width: 18px; height: 18px; }
-
-            QSlider::groove:horizontal {
-                border: 1px solid #334155; height: 10px; 
-                background: #0f172a; border-radius: 5px;
-            }
+            QPushButton#priorityBtn { background-color: #d97706; }
+            QPushButton#priorityBtn:hover { background-color: #b45309; }
+            QPushButton#toggleVocalBtn { background-color: #8b5cf6; }
+            QPushButton#toggleVocalBtn:hover { background-color: #7c3aed; }
+            QSlider::groove:horizontal { border: 1px solid #334155; height: 10px; background: #0f172a; border-radius: 5px; }
             QSlider::sub-page:horizontal { background: #3b82f6; border-radius: 5px; }
-            QSlider::handle:horizontal {
-                background: #f8fafc; width: 20px; 
-                margin-top: -5px; margin-bottom: -5px; border-radius: 10px;
-            }
-            QSlider::handle:horizontal:hover {
-                background: #60a5fa;
-            }
+            QSlider::handle:horizontal { background: #f8fafc; width: 20px; margin-top: -5px; margin-bottom: -5px; border-radius: 10px; }
         """)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         root_layout = QVBoxLayout(central_widget)
-        root_layout.setSpacing(12)
-        root_layout.setContentsMargins(16, 16, 16, 16)
 
         top_bar = QHBoxLayout()
         self.now_playing_label = QLabel("<b>Now Playing:</b> None")
-        self.now_playing_label.setStyleSheet(
-            "color: #38bdf8; font-size: 15px;"
-        )
+        self.now_playing_label.setStyleSheet("color: #38bdf8; font-size: 15px;")
         top_bar.addWidget(self.now_playing_label, stretch=1)
 
         self.btn_fullscreen = QPushButton("🖥️ Display Window (F)")
@@ -444,44 +412,33 @@ class KTVControlWindow(QMainWindow):
         root_layout.addLayout(top_bar)
 
         grid_layout = QHBoxLayout()
-        grid_layout.setSpacing(16)
-
         left_col = QVBoxLayout()
-        left_col.setSpacing(12)
 
-        out_box = QGroupBox("🔊 Output Hardware Device")
+        out_box = QGroupBox("🔊 Hardware Audio Output")
         out_layout = QVBoxLayout(out_box)
-        out_layout.setSpacing(10)
-
-        out_dev_row = QHBoxLayout()
-        out_dev_row.addWidget(QLabel("<b>Output:</b>"))
         self.output_combo = QComboBox()
         self.output_combo.currentIndexChanged.connect(
             self.on_output_device_changed
         )
-        out_dev_row.addWidget(self.output_combo, stretch=1)
-        out_layout.addLayout(out_dev_row)
+        out_layout.addWidget(self.output_combo)
         left_col.addWidget(out_box)
 
-        music_box = QGroupBox("🎵 Music Playback & Audio Control")
+        music_box = QGroupBox("🎵 Music & Audio Track Controls")
         music_layout = QVBoxLayout(music_box)
-        music_layout.setSpacing(10)
 
         folder_row = QHBoxLayout()
-        self.btn_open = QPushButton("📁 Change Folder")
+        self.btn_open = QPushButton("📁 Select Folder")
         self.btn_open.setObjectName("primaryBtn")
         self.btn_open.clicked.connect(self.select_folder)
         folder_row.addWidget(self.btn_open)
 
         self.btn_refresh = QPushButton("🔄 Refresh Library")
-        self.btn_refresh.setObjectName("refreshBtn")
         self.btn_refresh.clicked.connect(self.refresh_library)
         folder_row.addWidget(self.btn_refresh)
         music_layout.addLayout(folder_row)
 
         playback_row = QHBoxLayout()
         self.btn_play_pause = QPushButton("⏸ Pause")
-        self.btn_play_pause.setObjectName("playBtn")
         self.btn_play_pause.clicked.connect(self.toggle_play_pause)
         playback_row.addWidget(self.btn_play_pause)
 
@@ -490,31 +447,24 @@ class KTVControlWindow(QMainWindow):
         playback_row.addWidget(self.btn_skip)
         music_layout.addLayout(playback_row)
 
-        track_row = QHBoxLayout()
-        track_row.addWidget(QLabel("<b>Track Mode:</b>"))
-        self.btn_stereo = QPushButton("Stereo")
-        self.btn_stereo.clicked.connect(
-            lambda: self.set_audio_channel("stereo")
-        )
-        track_row.addWidget(self.btn_stereo)
+        vocal_row = QHBoxLayout()
+        vocal_row.addWidget(QLabel("<b>Vocal Mode:</b>"))
+        self.btn_vocal_toggle = QPushButton("🎤 Dual (原唱+伴唱)")
+        self.btn_vocal_toggle.setObjectName("toggleVocalBtn")
+        self.btn_vocal_toggle.clicked.connect(self.cycle_vocal_mode)
+        vocal_row.addWidget(self.btn_vocal_toggle, stretch=1)
+        music_layout.addLayout(vocal_row)
 
-        self.btn_left = QPushButton("Music (L)")
-        self.btn_left.clicked.connect(lambda: self.set_audio_channel("left"))
-        track_row.addWidget(self.btn_left)
-
-        self.btn_right = QPushButton("Vocal (R)")
-        self.btn_right.clicked.connect(lambda: self.set_audio_channel("right"))
-        track_row.addWidget(self.btn_right)
-        music_layout.addLayout(track_row)
-
-        eq_row = QHBoxLayout()
-        self.btn_vocal_eq = QPushButton(
-            "🎙️ Vocal Parametric EQ (80-4kHz Cut): OFF"
-        )
-        self.btn_vocal_eq.setObjectName("eqFilterOff")
-        self.btn_vocal_eq.clicked.connect(self.toggle_vocal_eq)
-        eq_row.addWidget(self.btn_vocal_eq)
-        music_layout.addLayout(eq_row)
+        tempo_row = QHBoxLayout()
+        tempo_row.addWidget(QLabel("<b>Pitch/Speed:</b>"))
+        self.tempo_slider = QSlider(Qt.Orientation.Horizontal)
+        self.tempo_slider.setRange(80, 120)
+        self.tempo_slider.setValue(100)
+        self.tempo_slider.valueChanged.connect(self.change_playback_speed)
+        tempo_row.addWidget(self.tempo_slider, stretch=1)
+        self.tempo_label = QLabel("1.0x")
+        tempo_row.addWidget(self.tempo_label)
+        music_layout.addLayout(tempo_row)
 
         vol_row = QHBoxLayout()
         vol_row.addWidget(QLabel("<b>Music Vol:</b>"))
@@ -524,21 +474,18 @@ class KTVControlWindow(QMainWindow):
         self.music_vol_slider.valueChanged.connect(self.change_music_volume)
         vol_row.addWidget(self.music_vol_slider, stretch=1)
         self.music_vol_label = QLabel("80%")
-        self.music_vol_label.setFixedWidth(40)
         vol_row.addWidget(self.music_vol_label)
         music_layout.addLayout(vol_row)
 
         left_col.addWidget(music_box)
 
+        # --- MIC 1 CONTROL BOX WITH LIVE VU METER ---
         mic1_box = QGroupBox("🎙️ Microphone 1 Controls")
         mic1_layout = QVBoxLayout(mic1_box)
-        mic1_layout.setSpacing(10)
-
         m1_dev_row = QHBoxLayout()
         self.mic1_combo = QComboBox()
         m1_dev_row.addWidget(self.mic1_combo, stretch=1)
         self.btn_mic1_toggle = QPushButton("Mic 1 OFF")
-        self.btn_mic1_toggle.setObjectName("micBtnOff")
         self.btn_mic1_toggle.clicked.connect(self.toggle_mic1)
         m1_dev_row.addWidget(self.btn_mic1_toggle)
         mic1_layout.addLayout(m1_dev_row)
@@ -547,25 +494,35 @@ class KTVControlWindow(QMainWindow):
         m1_vol_row.addWidget(QLabel("Gain Vol:"))
         self.mic1_vol_slider = QSlider(Qt.Orientation.Horizontal)
         self.mic1_vol_slider.setRange(0, 200)
-        self.mic1_vol_slider.setValue(100)
+        self.mic1_vol_slider.setValue(80)  # Default 80% to avoid initial overdrive
         self.mic1_vol_slider.valueChanged.connect(self.update_mic_settings)
         m1_vol_row.addWidget(self.mic1_vol_slider, stretch=1)
-        self.mic1_vol_label = QLabel("100%")
-        self.mic1_vol_label.setFixedWidth(45)
+        self.mic1_vol_label = QLabel("80%")
         m1_vol_row.addWidget(self.mic1_vol_label)
         mic1_layout.addLayout(m1_vol_row)
 
+        m1_meter_row = QHBoxLayout()
+        m1_meter_row.addWidget(QLabel("Input Level:"))
+        self.mic1_bar = QProgressBar()
+        self.mic1_bar.setRange(0, 100)
+        self.mic1_bar.setValue(0)
+        self.mic1_bar.setTextVisible(False)
+        self.mic1_bar.setFixedHeight(14)
+        self.set_meter_style(self.mic1_bar, False)
+        m1_meter_row.addWidget(self.mic1_bar, stretch=1)
+        self.mic1_level_label = QLabel("0%")
+        m1_meter_row.addWidget(self.mic1_level_label)
+        mic1_layout.addLayout(m1_meter_row)
+
         left_col.addWidget(mic1_box)
 
+        # --- MIC 2 CONTROL BOX WITH LIVE VU METER ---
         mic2_box = QGroupBox("🎙️ Microphone 2 Controls")
         mic2_layout = QVBoxLayout(mic2_box)
-        mic2_layout.setSpacing(10)
-
         m2_dev_row = QHBoxLayout()
         self.mic2_combo = QComboBox()
         m2_dev_row.addWidget(self.mic2_combo, stretch=1)
         self.btn_mic2_toggle = QPushButton("Mic 2 OFF")
-        self.btn_mic2_toggle.setObjectName("micBtnOff")
         self.btn_mic2_toggle.clicked.connect(self.toggle_mic2)
         m2_dev_row.addWidget(self.btn_mic2_toggle)
         mic2_layout.addLayout(m2_dev_row)
@@ -574,20 +531,30 @@ class KTVControlWindow(QMainWindow):
         m2_vol_row.addWidget(QLabel("Gain Vol:"))
         self.mic2_vol_slider = QSlider(Qt.Orientation.Horizontal)
         self.mic2_vol_slider.setRange(0, 200)
-        self.mic2_vol_slider.setValue(100)
+        self.mic2_vol_slider.setValue(80)  # Default 80% to avoid initial overdrive
         self.mic2_vol_slider.valueChanged.connect(self.update_mic_settings)
         m2_vol_row.addWidget(self.mic2_vol_slider, stretch=1)
-        self.mic2_vol_label = QLabel("100%")
-        self.mic2_vol_label.setFixedWidth(45)
+        self.mic2_vol_label = QLabel("80%")
         m2_vol_row.addWidget(self.mic2_vol_label)
         mic2_layout.addLayout(m2_vol_row)
+
+        m2_meter_row = QHBoxLayout()
+        m2_meter_row.addWidget(QLabel("Input Level:"))
+        self.mic2_bar = QProgressBar()
+        self.mic2_bar.setRange(0, 100)
+        self.mic2_bar.setValue(0)
+        self.mic2_bar.setTextVisible(False)
+        self.mic2_bar.setFixedHeight(14)
+        self.set_meter_style(self.mic2_bar, False)
+        m2_meter_row.addWidget(self.mic2_bar, stretch=1)
+        self.mic2_level_label = QLabel("0%")
+        m2_meter_row.addWidget(self.mic2_level_label)
+        mic2_layout.addLayout(m2_meter_row)
 
         left_col.addWidget(mic2_box)
 
         echo_box = QGroupBox("✨ Master Vocal Echo & Reverb")
         echo_layout = QVBoxLayout(echo_box)
-        echo_layout.setSpacing(10)
-
         delay_row = QHBoxLayout()
         delay_row.addWidget(QLabel("Echo Delay:"))
         self.echo_delay_slider = QSlider(Qt.Orientation.Horizontal)
@@ -596,7 +563,6 @@ class KTVControlWindow(QMainWindow):
         self.echo_delay_slider.valueChanged.connect(self.update_mic_settings)
         delay_row.addWidget(self.echo_delay_slider, stretch=1)
         self.echo_delay_label = QLabel("180ms")
-        self.echo_delay_label.setFixedWidth(45)
         delay_row.addWidget(self.echo_delay_label)
         echo_layout.addLayout(delay_row)
 
@@ -604,44 +570,80 @@ class KTVControlWindow(QMainWindow):
         decay_row.addWidget(QLabel("Echo Decay:"))
         self.echo_decay_slider = QSlider(Qt.Orientation.Horizontal)
         self.echo_decay_slider.setRange(0, 85)
-        self.echo_decay_slider.setValue(40)
+        self.echo_decay_slider.setValue(25)  # Default 25% to prevent feedback loops
         self.echo_decay_slider.valueChanged.connect(self.update_mic_settings)
         decay_row.addWidget(self.echo_decay_slider, stretch=1)
-        self.echo_decay_label = QLabel("40%")
-        self.echo_decay_label.setFixedWidth(45)
+        self.echo_decay_label = QLabel("25%")
         decay_row.addWidget(self.echo_decay_label)
         echo_layout.addLayout(decay_row)
-
         left_col.addWidget(echo_box)
 
         grid_layout.addLayout(left_col, stretch=1)
 
         right_col = QVBoxLayout()
-        right_col.setSpacing(12)
+        self.tab_widget = QTabWidget()
 
-        right_col.addWidget(QLabel("<b>🔍 Browse Song Library</b>"))
+        browse_tab = QWidget()
+        browse_layout = QVBoxLayout(browse_tab)
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("Search title or artist...")
         self.search_bar.textChanged.connect(self.filter_songs)
-        right_col.addWidget(self.search_bar)
+        browse_layout.addWidget(self.search_bar)
 
         self.library_list_widget = QListWidget()
         self.library_list_widget.itemDoubleClicked.connect(
-            self.add_selected_song_from_browser
+            lambda: self.add_selected_song_from_browser(insert_next=False)
         )
-        right_col.addWidget(self.library_list_widget, stretch=1)
+        browse_layout.addWidget(self.library_list_widget, stretch=1)
 
-        self.btn_add_browser = QPushButton("➕ Add Selected to Queue")
+        browse_btn_row = QHBoxLayout()
+        self.btn_add_browser = QPushButton("➕ Add to Queue")
         self.btn_add_browser.setObjectName("primaryBtn")
         self.btn_add_browser.clicked.connect(
-            self.add_selected_song_from_browser
+            lambda: self.add_selected_song_from_browser(insert_next=False)
         )
-        right_col.addWidget(self.btn_add_browser)
+        browse_btn_row.addWidget(self.btn_add_browser)
+
+        self.btn_insert_browser = QPushButton("⚡ Insert Next (插播)")
+        self.btn_insert_browser.setObjectName("priorityBtn")
+        self.btn_insert_browser.clicked.connect(
+            lambda: self.add_selected_song_from_browser(insert_next=True)
+        )
+        browse_btn_row.addWidget(self.btn_insert_browser)
+        browse_layout.addLayout(browse_btn_row)
+
+        self.tab_widget.addTab(browse_tab, "🔍 Browse Songs")
+
+        suggestions_tab = QWidget()
+        suggestions_layout = QVBoxLayout(suggestions_tab)
+        self.suggestions_list_widget = QListWidget()
+        self.suggestions_list_widget.itemDoubleClicked.connect(
+            lambda: self.add_selected_song_from_suggestions(insert_next=False)
+        )
+        suggestions_layout.addWidget(self.suggestions_list_widget, stretch=1)
+
+        sug_btn_row = QHBoxLayout()
+        self.btn_add_suggestion = QPushButton("➕ Add Suggestion")
+        self.btn_add_suggestion.setObjectName("primaryBtn")
+        self.btn_add_suggestion.clicked.connect(
+            lambda: self.add_selected_song_from_suggestions(insert_next=False)
+        )
+        sug_btn_row.addWidget(self.btn_add_suggestion)
+
+        self.btn_insert_suggestion = QPushButton("⚡ Insert Next (插播)")
+        self.btn_insert_suggestion.setObjectName("priorityBtn")
+        self.btn_insert_suggestion.clicked.connect(
+            lambda: self.add_selected_song_from_suggestions(insert_next=True)
+        )
+        sug_btn_row.addWidget(self.btn_insert_suggestion)
+        suggestions_layout.addLayout(sug_btn_row)
+
+        self.tab_widget.addTab(suggestions_tab, "💡 Song Suggestions")
+        right_col.addWidget(self.tab_widget, stretch=1)
 
         right_col.addWidget(
             QLabel("<b>📋 Selected Songs Queue</b> <i>(Drag to reorder)</i>")
         )
-
         self.queue_widget = DraggableQueueList()
         self.queue_widget.reorder_callback = self.on_queue_reordered
         right_col.addWidget(self.queue_widget, stretch=1)
@@ -651,14 +653,82 @@ class KTVControlWindow(QMainWindow):
         right_col.addWidget(btn_remove)
 
         grid_layout.addLayout(right_col, stretch=1)
-
         root_layout.addLayout(grid_layout)
+
+    def set_meter_style(self, progress_bar, is_clipping=False):
+        """Dynamic color style for standard levels vs clipping overload."""
+        if is_clipping:
+            progress_bar.setStyleSheet("""
+                QProgressBar {
+                    border: 1px solid #444; border-radius: 3px; background-color: #0f172a;
+                }
+                QProgressBar::chunk { background-color: #ef4444; }
+            """)
+        else:
+            progress_bar.setStyleSheet("""
+                QProgressBar {
+                    border: 1px solid #444; border-radius: 3px; background-color: #0f172a;
+                }
+                QProgressBar::chunk {
+                    background-color: qlineargradient(
+                        x1:0, y1:0, x2:1, y2:0,
+                        stop:0 #22c55e, stop:0.7 #eab308, stop:1.0 #f97316
+                    );
+                }
+            """)
+
+    def update_mic1_level(self, level, is_clipping):
+        self.mic1_bar.setValue(level)
+        self.mic1_level_label.setText(f"{level}%")
+        self.set_meter_style(self.mic1_bar, is_clipping)
+
+    def update_mic2_level(self, level, is_clipping):
+        self.mic2_bar.setValue(level)
+        self.mic2_level_label.setText(f"{level}%")
+        self.set_meter_style(self.mic2_bar, is_clipping)
 
     def handle_web_action(self, action):
         if action == "skip":
             self.play_next()
         elif action == "play_pause":
             self.toggle_play_pause()
+        elif action == "vocal_toggle":
+            self.cycle_vocal_mode()
+
+    def cycle_vocal_mode(self):
+        modes = ["both", "left", "right", "track2"]
+        curr_idx = modes.index(self.vocal_mode)
+        self.vocal_mode = modes[(curr_idx + 1) % len(modes)]
+
+        if self.vocal_mode == "both":
+            self.btn_vocal_toggle.setText("🎤 Dual (原唱+伴唱)")
+            self.media_player.audio_set_channel(
+                vlc.AudioOutputChannel.Stereo.value
+            )
+            self.media_player.audio_set_track(1)
+        elif self.vocal_mode == "left":
+            self.btn_vocal_toggle.setText("🎶 Left Channel (伴唱)")
+            self.media_player.audio_set_channel(
+                vlc.AudioOutputChannel.Left.value
+            )
+        elif self.vocal_mode == "right":
+            self.btn_vocal_toggle.setText("🎤 Right Channel (原唱)")
+            self.media_player.audio_set_channel(
+                vlc.AudioOutputChannel.Right.value
+            )
+        elif self.vocal_mode == "track2":
+            self.btn_vocal_toggle.setText("🔀 Track 2 Audio Switch")
+            self.media_player.audio_set_channel(
+                vlc.AudioOutputChannel.Stereo.value
+            )
+            self.media_player.audio_set_track(2)
+
+        broadcast_system_state()
+
+    def change_playback_speed(self, val):
+        self.playback_rate = val / 100.0
+        self.tempo_label.setText(f"{self.playback_rate:.1f}x")
+        self.media_player.set_rate(self.playback_rate)
 
     def toggle_display_fullscreen(self):
         if self.display_win.isFullScreen():
@@ -671,26 +741,48 @@ class KTVControlWindow(QMainWindow):
         self.mic2_combo.clear()
         self.output_combo.clear()
 
-        devices = sd.query_devices()
-        default_out_idx = sd.default.device[1]
+        try:
+            devices = sd.query_devices()
+        except Exception as e:
+            print(f"[PortAudio Query Warning] {e}", sys.stderr)
+            devices = []
+
+        pulse_idx = None
+        default_out_idx = None
+
+        try:
+            default_out_idx = sd.default.device[1]
+        except Exception:
+            pass
 
         for idx, dev in enumerate(devices):
-            if dev["max_input_channels"] > 0:
+            dev_name = dev["name"].lower()
+            if "pulse" in dev_name or "default" in dev_name:
+                pulse_idx = idx
+
+            if dev.get("max_input_channels", 0) > 0:
                 name = f"[{idx}] {dev['name']}"
                 self.mic1_combo.addItem(name, userData=idx)
                 self.mic2_combo.addItem(name, userData=idx)
 
-            if dev["max_output_channels"] > 0:
+            if dev.get("max_output_channels", 0) > 0:
                 name = f"[{idx}] {dev['name']}"
                 self.output_combo.addItem(name, userData=idx)
 
+        # Fallback to Pulse/Default virtual nodes first
+        if pulse_idx is not None:
+            for i in range(self.output_combo.count()):
+                if self.output_combo.itemData(i) == pulse_idx:
+                    self.output_combo.setCurrentIndex(i)
+                    break
+        elif default_out_idx is not None:
+            for i in range(self.output_combo.count()):
+                if self.output_combo.itemData(i) == default_out_idx:
+                    self.output_combo.setCurrentIndex(i)
+                    break
+
         if self.mic2_combo.count() > 1:
             self.mic2_combo.setCurrentIndex(1)
-
-        for i in range(self.output_combo.count()):
-            if self.output_combo.itemData(i) == default_out_idx:
-                self.output_combo.setCurrentIndex(i)
-                break
 
     def get_selected_output_device_id(self):
         return self.output_combo.currentData()
@@ -700,63 +792,36 @@ class KTVControlWindow(QMainWindow):
 
         if self.mic1_stream and self.mic1_stream.is_running:
             self.mic1_stream.stop()
-            self.mic1_stream = AudioPassthroughStream(
-                self.mic1_stream.input_device_id, out_id
-            )
+            dev_id = self.mic1_combo.currentData()
+            self.mic1_stream = AudioPassthroughStream(dev_id, out_id)
+            self.mic1_stream.emitter.level_signal.connect(self.update_mic1_level)
             self.mic1_stream.start()
 
         if self.mic2_stream and self.mic2_stream.is_running:
             self.mic2_stream.stop()
-            self.mic2_stream = AudioPassthroughStream(
-                self.mic2_stream.input_device_id, out_id
-            )
+            dev_id = self.mic2_combo.currentData()
+            self.mic2_stream = AudioPassthroughStream(dev_id, out_id)
+            self.mic2_stream.emitter.level_signal.connect(self.update_mic2_level)
             self.mic2_stream.start()
 
         self.update_mic_settings()
-        self.sync_vlc_output_device()
-
-    def sync_vlc_output_device(self):
-        out_id = self.get_selected_output_device_id()
-        if out_id is None:
-            return
-
-        target_name = sd.query_devices(out_id)["name"]
-
-        device_enum = self.media_player.audio_output_device_enum()
-        if device_enum:
-            curr = device_enum
-            while curr:
-                dev_id = curr.contents.device
-                dev_desc = (
-                    curr.contents.description.decode("utf-8", errors="ignore")
-                    if curr.contents.description
-                    else ""
-                )
-                if (
-                    target_name.lower() in dev_desc.lower()
-                    or dev_desc.lower() in target_name.lower()
-                ):
-                    self.media_player.audio_output_device_set(None, dev_id)
-                    break
-                curr = curr.contents.next
-
-            vlc.libvlc_audio_output_device_list_release(device_enum)
 
     def toggle_mic1(self):
         if self.mic1_stream and self.mic1_stream.is_running:
             self.mic1_stream.stop()
             self.mic1_stream = None
             self.btn_mic1_toggle.setText("Mic 1 OFF")
-            self.btn_mic1_toggle.setObjectName("micBtnOff")
+            self.update_mic1_level(0, False)
         else:
             dev_id = self.mic1_combo.currentData()
             out_id = self.get_selected_output_device_id()
-            if dev_id is not None:
-                self.mic1_stream = AudioPassthroughStream(dev_id, out_id)
-                self.mic1_stream.start()
+            self.mic1_stream = AudioPassthroughStream(dev_id, out_id)
+            self.mic1_stream.emitter.level_signal.connect(self.update_mic1_level)
+            self.mic1_stream.start()
+            if self.mic1_stream.is_running:
                 self.btn_mic1_toggle.setText("Mic 1 ON")
-                self.btn_mic1_toggle.setObjectName("micBtnOn")
-        self.btn_mic1_toggle.setStyle(self.btn_mic1_toggle.style())
+            else:
+                self.btn_mic1_toggle.setText("Mic 1 ERR")
         self.update_mic_settings()
 
     def toggle_mic2(self):
@@ -764,16 +829,17 @@ class KTVControlWindow(QMainWindow):
             self.mic2_stream.stop()
             self.mic2_stream = None
             self.btn_mic2_toggle.setText("Mic 2 OFF")
-            self.btn_mic2_toggle.setObjectName("micBtnOff")
+            self.update_mic2_level(0, False)
         else:
             dev_id = self.mic2_combo.currentData()
             out_id = self.get_selected_output_device_id()
-            if dev_id is not None:
-                self.mic2_stream = AudioPassthroughStream(dev_id, out_id)
-                self.mic2_stream.start()
+            self.mic2_stream = AudioPassthroughStream(dev_id, out_id)
+            self.mic2_stream.emitter.level_signal.connect(self.update_mic2_level)
+            self.mic2_stream.start()
+            if self.mic2_stream.is_running:
                 self.btn_mic2_toggle.setText("Mic 2 ON")
-                self.btn_mic2_toggle.setObjectName("micBtnOn")
-        self.btn_mic2_toggle.setStyle(self.btn_mic2_toggle.style())
+            else:
+                self.btn_mic2_toggle.setText("Mic 2 ERR")
         self.update_mic_settings()
 
     def update_mic_settings(self):
@@ -805,7 +871,7 @@ class KTVControlWindow(QMainWindow):
         for root, _, files in os.walk(folder_path):
             for file in files:
                 if file.lower().endswith(
-                    (".mp4", ".mkv", ".avi", ".mov", ".webm", ".mp3")
+                        (".mp4", ".mkv", ".avi", ".mov", ".webm", ".mp3")
                 ):
                     full_path = os.path.join(root, file)
                     song_name = os.path.splitext(file)[0]
@@ -814,6 +880,7 @@ class KTVControlWindow(QMainWindow):
                     )
 
         self.populate_library_list(self.song_library)
+        self.populate_suggestions_list()
 
     def select_folder(self):
         folder_path = QFileDialog.getExistingDirectory(
@@ -832,6 +899,16 @@ class KTVControlWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, song)
             self.library_list_widget.addItem(item)
 
+    def populate_suggestions_list(self):
+        self.suggestions_list_widget.clear()
+        suggestions = random.sample(
+            self.song_library, min(len(self.song_library), 10)
+        )
+        for song in suggestions:
+            item = QListWidgetItem(f"⭐ {song['name']}")
+            item.setData(Qt.ItemDataRole.UserRole, song)
+            self.suggestions_list_widget.addItem(item)
+
     def filter_songs(self, text):
         query = text.lower()
         filtered = [
@@ -839,17 +916,26 @@ class KTVControlWindow(QMainWindow):
         ]
         self.populate_library_list(filtered)
 
-    def add_selected_song_from_browser(self):
+    def add_selected_song_from_browser(self, insert_next=False):
         selected_items = self.library_list_widget.selectedItems()
-        if not selected_items:
-            return
         for item in selected_items:
             song = item.data(Qt.ItemDataRole.UserRole)
-            self.add_song_to_queue(song)
+            self.add_song_to_queue(song, insert_next)
 
-    def add_song_to_queue(self, song):
-        self.selected_queue.append(song)
+    def add_selected_song_from_suggestions(self, insert_next=False):
+        selected_items = self.suggestions_list_widget.selectedItems()
+        for item in selected_items:
+            song = item.data(Qt.ItemDataRole.UserRole)
+            self.add_song_to_queue(song, insert_next)
+
+    def add_song_to_queue(self, song, insert_next=False):
+        if insert_next:
+            self.selected_queue.insert(0, song)
+        else:
+            self.selected_queue.append(song)
+
         self.refresh_queue_widget()
+        broadcast_system_state()
 
         if not self.media_player.is_playing() and not self.current_song:
             self.play_next()
@@ -867,16 +953,16 @@ class KTVControlWindow(QMainWindow):
             item = self.queue_widget.item(i)
             new_queue.append(item.data(Qt.ItemDataRole.UserRole))
         self.selected_queue = new_queue
+        broadcast_system_state()
 
     def remove_from_queue(self):
         selected_items = self.queue_widget.selectedItems()
-        if not selected_items:
-            return
         for item in selected_items:
             song = item.data(Qt.ItemDataRole.UserRole)
             if song in self.selected_queue:
                 self.selected_queue.remove(song)
         self.refresh_queue_widget()
+        broadcast_system_state()
 
     def play_next(self):
         if self.selected_queue:
@@ -891,6 +977,8 @@ class KTVControlWindow(QMainWindow):
             self.current_song = None
             self.now_playing_label.setText("<b>Now Playing:</b> None")
 
+        broadcast_system_state()
+
     def play_song(self, song):
         self.current_song = song
         self.now_playing_label.setText(
@@ -900,10 +988,22 @@ class KTVControlWindow(QMainWindow):
         media = self.vlc_instance.media_new(song["path"])
         self.media_player.set_media(media)
         self.media_player.play()
-        self.btn_play_pause.setText("⏸ Pause")
 
-        # Re-apply current volume
+        QTimer.singleShot(200, self._setup_audio_tracks_deferred)
+
+        self.btn_play_pause.setText("⏸ Pause")
         self.change_music_volume(self.music_vol_slider.value())
+        self.media_player.set_rate(self.playback_rate)
+
+    def _setup_audio_tracks_deferred(self):
+        self.media_player.audio_set_mute(False)
+        self.media_player.audio_set_volume(self.music_vol_slider.value())
+
+        track_count = self.media_player.audio_get_track_count()
+        if track_count <= 0:
+            print("[VLC Warning] No audio tracks parsed or available in file.")
+        else:
+            self.media_player.audio_set_track(1)
 
     def toggle_play_pause(self):
         if self.media_player.is_playing():
@@ -912,28 +1012,7 @@ class KTVControlWindow(QMainWindow):
         else:
             self.media_player.play()
             self.btn_play_pause.setText("⏸ Pause")
-
-    def set_audio_channel(self, mode):
-        if mode == "stereo":
-            self.media_player.audio_set_channel(vlc.AudioOutputChannel.Stereo)
-        elif mode == "left":
-            self.media_player.audio_set_channel(vlc.AudioOutputChannel.Left)
-        elif mode == "right":
-            self.media_player.audio_set_channel(vlc.AudioOutputChannel.Right)
-
-    def toggle_vocal_eq(self):
-        self.vocal_eq_active = not self.vocal_eq_active
-        if self.vocal_eq_active:
-            self.btn_vocal_eq.setText(
-                "🎙️ Vocal Parametric EQ (80-4kHz Cut): ON"
-            )
-            self.btn_vocal_eq.setObjectName("eqFilterOn")
-        else:
-            self.btn_vocal_eq.setText(
-                "🎙️ Vocal Parametric EQ (80-4kHz Cut): OFF"
-            )
-            self.btn_vocal_eq.setObjectName("eqFilterOff")
-        self.btn_vocal_eq.setStyle(self.btn_vocal_eq.style())
+        broadcast_system_state()
 
     def change_music_volume(self, value):
         self.media_player.audio_set_volume(value)
@@ -945,11 +1024,40 @@ class KTVControlWindow(QMainWindow):
             if self.chk_autoplay.isChecked():
                 self.play_next()
 
+        if self.media_player.is_playing():
+            curr_time_ms = self.media_player.get_time()
+            total_time_ms = self.media_player.get_length()
+            spu_description = self.media_player.video_get_spu_description()
+
+            lyric_line = ""
+            if spu_description:
+                for spu_id, spu_name in spu_description:
+                    if spu_id != -1 and spu_name:
+                        lyric_line = spu_name.decode("utf-8", errors="ignore")
+
+            socketio.emit(
+                "telemetry",
+                {
+                    "time_ms": curr_time_ms,
+                    "length_ms": total_time_ms,
+                    "lyric": lyric_line,
+                },
+            )
+
+    def closeEvent(self, event):
+        if self.mic1_stream:
+            self.mic1_stream.stop()
+        if self.mic2_stream:
+            self.mic2_stream.stop()
+        event.accept()
+
 
 # ==============================================================================
-# 8. FLASK WEB SERVER FOR MOBILE CONTROLLER
+# FLASK WEB SERVER + SOCKET.IO WEBSOCKET MOBILE REMOTE
 # ==============================================================================
 app = Flask(__name__)
+app.config["SECRET_KEY"] = "ktv_secret_key"
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 control_win = None
 
 HTML_TEMPLATE = """
@@ -957,60 +1065,49 @@ HTML_TEMPLATE = """
 <html>
 <head>
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>KTV Mobile Remote</title>
+    <title>KTV Real-Time Mobile Remote</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 15px; background: #0f172a; color: #fff; margin: 0; }
         h2, h3 { text-align: center; margin-top: 10px; color: #38bdf8; }
         .now-playing-box {
-            background: #1e293b;
-            border: 1px solid #38bdf8;
-            border-radius: 10px;
-            padding: 12px;
-            text-align: center;
-            margin-bottom: 15px;
+            background: #1e293b; border: 1px solid #38bdf8; border-radius: 12px;
+            padding: 14px; text-align: center; margin-bottom: 15px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3);
         }
-        .now-playing-title {
-            font-weight: bold;
-            font-size: 16px;
-            color: #38bdf8;
-            margin-top: 4px;
-        }
-        .controls-row {
-            display: flex;
-            gap: 10px;
-            justify-content: center;
-            margin-top: 10px;
-        }
+        .now-playing-title { font-weight: bold; font-size: 18px; color: #38bdf8; margin-top: 4px; }
+        .lyrics-box { color: #f59e0b; font-size: 15px; font-weight: bold; min-height: 24px; margin-top: 8px; font-style: italic; }
+        .controls-row { display: flex; gap: 8px; justify-content: center; margin-top: 12px; }
         .btn-ctrl {
-            flex: 1;
-            padding: 10px 16px;
-            font-size: 15px;
-            font-weight: bold;
-            border-radius: 8px;
-            border: none;
-            color: white;
-            cursor: pointer;
+            flex: 1; padding: 10px 12px; font-size: 14px; font-weight: bold;
+            border-radius: 8px; border: none; color: white; cursor: pointer;
         }
         .btn-play { background: #16a34a; }
-        .btn-play:active { background: #15803d; }
         .btn-skip { background: #d97706; }
-        .btn-skip:active { background: #b45309; }
+        .btn-vocal { background: #8b5cf6; }
         input { width: 100%; padding: 12px; box-sizing: border-box; border-radius: 8px; border: 1px solid #334155; background: #1e293b; color: white; font-size: 16px; margin-bottom: 15px; }
         ul { list-style: none; padding: 0; margin: 0; }
         li { background: #1e293b; margin-bottom: 8px; padding: 12px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; border: 1px solid #334155; }
-        button.btn-add { background: #2563eb; color: white; border: none; padding: 8px 14px; border-radius: 6px; font-weight: bold; cursor: pointer; }
-        button.btn-add:active { background: #1d4ed8; }
+        .btn-group { display: flex; gap: 6px; }
+        button.btn-add { background: #2563eb; color: white; border: none; padding: 8px 12px; border-radius: 6px; font-weight: bold; }
+        button.btn-insert { background: #d97706; color: white; border: none; padding: 8px 12px; border-radius: 6px; font-weight: bold; }
         .queue-item { background: #0f172a; border-left: 4px solid #38bdf8; }
+        .suggestion-item { background: #1e293b; border-left: 4px solid #f59e0b; }
+        .progress-bar-container { background: #334155; height: 6px; border-radius: 3px; overflow: hidden; margin-top: 10px; }
+        .progress-bar-fill { background: #38bdf8; height: 100%; width: 0%; transition: width 0.3s ease; }
     </style>
 </head>
 <body>
     <h2>🎤 KTV Remote</h2>
 
     <div class="now-playing-box">
-        <div style="font-size: 12px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px;">Now Playing</div>
+        <div style="font-size: 11px; color: #94a3b8; text-transform: uppercase;">Now Playing</div>
         <div id="nowPlayingText" class="now-playing-title">None</div>
+        <div id="lyricsText" class="lyrics-box"></div>
+        <div class="progress-bar-container"><div id="progressFill" class="progress-bar-fill"></div></div>
+
         <div class="controls-row">
-            <button id="btnPlayPause" class="btn-ctrl btn-play" onclick="triggerAction('play_pause')">⏯ Pause / Play</button>
+            <button id="btnPlayPause" class="btn-ctrl btn-play" onclick="triggerAction('play_pause')">⏯ Pause</button>
+            <button id="btnVocalToggle" class="btn-ctrl btn-vocal" onclick="triggerAction('vocal_toggle')">🎤 Vocal</button>
             <button class="btn-ctrl btn-skip" onclick="triggerAction('skip')">⏭ Skip</button>
         </div>
     </div>
@@ -1019,77 +1116,88 @@ HTML_TEMPLATE = """
     <ul id="queueList"></ul>
 
     <hr style="border-color: #334155; margin: 20px 0;">
+    <h3>💡 Suggested Songs</h3>
+    <ul id="suggestionsList"></ul>
 
+    <hr style="border-color: #334155; margin: 20px 0;">
     <h3>Song Library</h3>
     <input type="text" id="searchInput" onkeyup="filterSongs()" placeholder="Search library...">
     <ul id="libraryList"></ul>
 
     <script>
+        const socket = io();
         let fullLibrary = [];
 
-        function fetchStatus() {
-            fetch('/api/status')
-                .then(r => r.json())
-                .then(data => {
-                    document.getElementById('nowPlayingText').innerText = data.now_playing || 'None';
-                    const btn = document.getElementById('btnPlayPause');
-                    if (data.is_playing) {
-                        btn.innerText = '⏸ Pause';
-                    } else {
-                        btn.innerText = '▶ Play';
-                    }
-                });
-        }
+        socket.on('state_update', data => {
+            document.getElementById('nowPlayingText').innerText = data.now_playing || 'None';
+            document.getElementById('btnPlayPause').innerText = data.is_playing ? '⏸ Pause' : '▶ Play';
 
-        function fetchQueue() {
-            fetch('/api/queue')
-                .then(r => r.json())
-                .then(data => {
-                    const list = document.getElementById('queueList');
-                    if (data.queue.length === 0) {
-                        list.innerHTML = '<li style="color:#64748b;">Queue is empty</li>';
-                    } else {
-                        list.innerHTML = data.queue.map((s, i) => `<li class="queue-item"><span>${i+1}. ${s}</span></li>`).join('');
-                    }
-                });
-        }
+            const vocalBtn = document.getElementById('btnVocalToggle');
+            if (data.vocal_mode === 'both') vocalBtn.innerText = '🎤 Dual';
+            else if (data.vocal_mode === 'left') vocalBtn.innerText = '🎶 Left (伴唱)';
+            else if (data.vocal_mode === 'right') vocalBtn.innerText = '🎤 Right (原唱)';
+            else vocalBtn.innerText = '🔀 Track 2';
 
-        function fetchLibrary() {
-            fetch('/api/library')
-                .then(r => r.json())
-                .then(data => {
-                    fullLibrary = data.library;
-                    renderLibrary(fullLibrary);
-                });
+            const queueList = document.getElementById('queueList');
+            if (!data.queue || data.queue.length === 0) {
+                queueList.innerHTML = '<li style="color:#64748b;">Queue is empty</li>';
+            } else {
+                queueList.innerHTML = data.queue.map((s, i) => `<li class="queue-item"><span>${i+1}. ${s}</span></li>`).join('');
+            }
+        });
+
+        socket.on('telemetry', data => {
+            if (data.length_ms > 0) {
+                const pct = (data.time_ms / data.length_ms) * 100;
+                document.getElementById('progressFill').style.width = pct + '%';
+            }
+            if (data.lyric) {
+                document.getElementById('lyricsText').innerText = data.lyric;
+            }
+        });
+
+        function fetchStaticData() {
+            fetch('/api/library').then(r => r.json()).then(data => {
+                fullLibrary = data.library;
+                renderLibrary(fullLibrary);
+            });
+            fetch('/api/suggestions').then(r => r.json()).then(data => {
+                const list = document.getElementById('suggestionsList');
+                list.innerHTML = data.suggestions.map(song => `
+                    <li class="suggestion-item">
+                        <span>⭐ ${song}</span>
+                        <div class="btn-group">
+                            <button class="btn-add" onclick="addSong('${song.replace(/'/g, "\\'")}', false)">Add</button>
+                            <button class="btn-insert" onclick="addSong('${song.replace(/'/g, "\\'")}', true)">⚡ Insert</button>
+                        </div>
+                    </li>
+                `).join('');
+            });
         }
 
         function renderLibrary(songs) {
             const list = document.getElementById('libraryList');
-            if (songs.length === 0) {
-                list.innerHTML = '<li style="color:#64748b;">No songs found</li>';
-                return;
-            }
             list.innerHTML = songs.map(song => `
                 <li>
                     <span>${song}</span>
-                    <button class="btn-add" onclick="addSong('${song.replace(/'/g, "\\'")}')">Add</button>
+                    <div class="btn-group">
+                        <button class="btn-add" onclick="addSong('${song.replace(/'/g, "\\'")}', false)">Add</button>
+                        <button class="btn-insert" onclick="addSong('${song.replace(/'/g, "\\'")}', true)">⚡ Insert</button>
+                    </div>
                 </li>
             `).join('');
         }
 
         function filterSongs() {
             const query = document.getElementById('searchInput').value.toLowerCase();
-            const filtered = fullLibrary.filter(s => s.toLowerCase().includes(query));
-            renderLibrary(filtered);
+            renderLibrary(fullLibrary.filter(s => s.toLowerCase().includes(query)));
         }
 
-        function addSong(songTitle) {
+        function addSong(songTitle, insertNext) {
             fetch('/api/queue', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ song: songTitle })
-            }).then(() => {
-                fetchQueue();
+                body: JSON.stringify({ song: songTitle, insert_next: insertNext })
             });
         }
 
@@ -1098,33 +1206,17 @@ HTML_TEMPLATE = """
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ action: actionName })
-            }).then(() => {
-                fetchStatus();
-                fetchQueue();
             });
         }
 
-        setInterval(() => {
-            fetchStatus();
-            fetchQueue();
-        }, 2000);
-
-        fetchStatus();
-        fetchQueue();
-        fetchLibrary();
+        fetchStaticData();
     </script>
 </body>
 </html>
 """
 
 
-@app.route("/")
-def index():
-    return render_template_string(HTML_TEMPLATE)
-
-
-@app.route("/api/status", methods=["GET"])
-def get_status():
+def broadcast_system_state():
     if control_win:
         now_playing = (
             control_win.current_song["name"]
@@ -1132,8 +1224,23 @@ def get_status():
             else "None"
         )
         is_playing = control_win.media_player.is_playing() == 1
-        return jsonify({"now_playing": now_playing, "is_playing": is_playing})
-    return jsonify({"now_playing": "None", "is_playing": False})
+        queue_titles = [s["name"] for s in control_win.selected_queue]
+        vocal_mode = control_win.vocal_mode
+
+        socketio.emit(
+            "state_update",
+            {
+                "now_playing": now_playing,
+                "is_playing": is_playing,
+                "queue": queue_titles,
+                "vocal_mode": vocal_mode,
+            },
+        )
+
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_TEMPLATE)
 
 
 @app.route("/api/library", methods=["GET"])
@@ -1144,18 +1251,20 @@ def get_library():
     return jsonify({"library": []})
 
 
-@app.route("/api/queue", methods=["GET"])
-def get_queue():
-    if control_win:
-        queue_titles = [s["name"] for s in control_win.selected_queue]
-        return jsonify({"queue": queue_titles})
-    return jsonify({"queue": []})
+@app.route("/api/suggestions", methods=["GET"])
+def get_suggestions():
+    if control_win and control_win.song_library:
+        sample_size = min(len(control_win.song_library), 5)
+        sampled_songs = random.sample(control_win.song_library, sample_size)
+        return jsonify({"suggestions": [s["name"] for s in sampled_songs]})
+    return jsonify({"suggestions": []})
 
 
 @app.route("/api/queue", methods=["POST"])
 def post_queue():
     data = request.get_json()
     song_name = data.get("song")
+    insert_next = data.get("insert_next", False)
 
     if song_name and control_win:
         matched_song = next(
@@ -1163,7 +1272,7 @@ def post_queue():
             None,
         )
         if matched_song:
-            control_win.web_song_added.emit(matched_song)
+            control_win.web_song_added.emit(matched_song, insert_next)
             return jsonify({"status": "success", "song": song_name}), 200
 
     return jsonify({"status": "error", "message": "Song not found"}), 400
@@ -1181,13 +1290,22 @@ def trigger_action():
     return jsonify({"status": "error", "message": "Invalid action"}), 400
 
 
+@socketio.on("connect")
+def handle_connect():
+    broadcast_system_state()
+
+
 def start_flask_server():
-    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+    socketio.run(
+        app,
+        host="0.0.0.0",
+        port=5000,
+        debug=False,
+        use_reloader=False,
+        allow_unsafe_werkzeug=True,
+    )
 
 
-# ==============================================================================
-# 9. APPLICATION ENTRY POINT
-# ==============================================================================
 def main():
     global control_win
     qapp = QApplication(sys.argv)
