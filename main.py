@@ -18,6 +18,7 @@ os.environ["QT_QPA_PLATFORM"] = "xcb"
 from flask import Flask, jsonify, render_template_string, request
 from flask_socketio import SocketIO, emit
 import numpy as np
+from scipy.signal import butter, sosfilt, sosfilt_zi
 import sounddevice as sd
 import vlc
 
@@ -56,12 +57,11 @@ def get_truncated_title(title, max_length=40):
 # QT SIGNAL EMITTER FOR THREAD-SAFE MIC LEVEL UPDATES
 # ==============================================================================
 class MicLevelEmitter(QObject):
-    # Sends: volume_percent (0-100), is_clipping (bool)
     level_signal = pyqtSignal(int, bool)
 
 
 # ==============================================================================
-# LOW-LATENCY SOFTWARE AUDIO STREAM WITH ECHO / REVERB DSP & LIVE FEEDBACK
+# LOW-LATENCY SOFTWARE AUDIO STREAM WITH SCIPY SOS FILTER & REVERB DSP
 # ==============================================================================
 class AudioPassthroughStream:
 
@@ -69,10 +69,11 @@ class AudioPassthroughStream:
         self.input_device_id = input_device_id
         self.output_device_id = output_device_id
         self.sample_rate = sample_rate
-        self.volume = 0.8  # Default conservative gain to avoid overdrive
+        self.gain = 2.5
+        self.hp_cutoff = 100.0
 
         self.echo_delay_ms = 180
-        self.echo_feedback = 0.25  # Controlled default echo decay
+        self.echo_feedback = 0.20
 
         self.buffer_size = sample_rate * 2
         self.delay_buffer = np.zeros((self.buffer_size, 2), dtype=np.float32)
@@ -80,70 +81,89 @@ class AudioPassthroughStream:
 
         self.is_running = False
         self.stream = None
-
-        # Counter for GUI signal throttling
         self._frame_counter = 0
 
-        # Live level feedback signal emitter
+        # High-Pass Filter Setup using Second-Order Sections (SOS)
+        self._update_filter()
+
         self.emitter = MicLevelEmitter()
+
+    def _update_filter(self):
+        """Re-calculates high-pass filter coefficients."""
+        self.sos = butter(2, self.hp_cutoff, 'hp', fs=self.sample_rate, output='sos')
+        self.zi = sosfilt_zi(self.sos)
+        self.filter_state = None
 
     def _audio_callback(self, indata, outdata, frames, time, status):
         if status:
             print(f"[Mic Buffer Warning] {status}", sys.stderr)
 
         try:
-            # --- Live Level Feedback Calculation & Throttle ---
-            rms = np.sqrt(np.mean(indata ** 2))
-            peak = np.max(np.abs(indata))
-            vol_percent = int(min(1.0, rms * 6.0) * 100)
+            channels = indata.shape[1]
 
-            # FIX 1: Explicit python bool cast to satisfy PyQt signal type check
-            is_clipping = bool(peak > 0.92)
+            # 1. State initialization for filter continuity
+            # zi has shape (n_sections, 2) -> expanded to (n_sections, 2, channels)
+            if self.filter_state is None or self.filter_state.shape[2] != channels:
+                self.filter_state = np.repeat(self.zi[:, :, np.newaxis], channels, axis=2)
 
-            # Throttle signal to prevent Qt thread GUI queue flooding (~30ms rate)
+            # 2. High-Pass Filter (Strip static-causing sub-100Hz rumble)
+            filtered, self.filter_state = sosfilt(self.sos, indata, axis=0, zi=self.filter_state)
+
+            # 3. Apply Digital Gain Boost
+            amplified = filtered * self.gain
+
+            # 4. Measure Peak and RMS Levels
+            rms = np.sqrt(np.mean(amplified ** 2))
+            peak = np.max(np.abs(amplified))
+
+            # 5. Soft Noise Gate Thresholding
+            NOISE_GATE_THRESHOLD = 0.004
+            if rms < NOISE_GATE_THRESHOLD:
+                attenuation = max(0.0, (rms / NOISE_GATE_THRESHOLD) ** 2) if NOISE_GATE_THRESHOLD > 0 else 0
+                amplified *= attenuation
+                vol_percent = 0
+            else:
+                vol_percent = int(min(1.0, rms * 4.0) * 100)
+
+            is_clipping = bool(peak > 0.90)
+
+            # Throttle GUI Signal Update
             self._frame_counter += 1
             if self._frame_counter % 10 == 0:
-                self.emitter.level_signal.emit(vol_percent, is_clipping)
+                self.emitter.level_signal.emit(int(vol_percent), is_clipping)
                 self._frame_counter = 0
 
-            # --- DSP Pass-through & Echo Logic ---
-            in_chans = indata.shape[1]
+            # 6. Channel Matching
+            in_chans = amplified.shape[1]
             out_chans = outdata.shape[1]
 
             if in_chans == 1 and out_chans >= 2:
-                in_samples = np.column_stack((indata[:, 0], indata[:, 0]))
+                in_samples = np.column_stack((amplified[:, 0], amplified[:, 0]))
+            elif in_chans >= 2 and out_chans >= 2:
+                in_samples = amplified[:, :2]
             else:
-                in_samples = indata[:, : min(in_chans, out_chans)]
+                in_samples = amplified
 
-            # Soft headroom clamp on input gain to prevent harsh clipping
-            processed = np.clip(in_samples * self.volume, -0.9, 0.9)
+            processed = np.clip(in_samples * 0.95, -1.0, 1.0)
 
+            # 7. Echo / Delay Loop Buffer
             delay_samples = int((self.echo_delay_ms / 1000.0) * self.sample_rate)
             read_indices = (
-                                   np.arange(self.write_pos, self.write_pos + frames) - delay_samples
-                           ) % self.buffer_size
+                np.arange(self.write_pos, self.write_pos + frames) - delay_samples
+            ) % self.buffer_size
             write_indices = (
-                                np.arange(self.write_pos, self.write_pos + frames)
-                            ) % self.buffer_size
+                np.arange(self.write_pos, self.write_pos + frames)
+            ) % self.buffer_size
 
-            delayed_samples = self.delay_buffer[
-                read_indices, : processed.shape[1]
-            ]
-
-            # Mix input signal with echo delay tail
+            delayed_samples = self.delay_buffer[read_indices, : processed.shape[1]]
             mixed_samples = processed + (delayed_samples * self.echo_feedback)
 
-            # FIX 2: Multiply delay write-back by 0.95 safety factor to curb runaway feedback loops
-            self.delay_buffer[
-                write_indices, : processed.shape[1]
-            ] = mixed_samples * 0.95
+            self.delay_buffer[write_indices, : processed.shape[1]] = mixed_samples * 0.85
             self.write_pos = (self.write_pos + frames) % self.buffer_size
 
             outdata.fill(0)
-            # FIX 2 (cont): Smooth hyperbolic tangent saturation to eliminate audio cracking & distortion
-            outdata[:, : mixed_samples.shape[1]] = np.tanh(mixed_samples)
+            outdata[:, : mixed_samples.shape[1]] = np.clip(mixed_samples, -1.0, 1.0)
         except Exception as e:
-            # Silence buffer output and prevent PortAudio thread crash
             outdata.fill(0)
             print(f"[Callback DSP Error] {e}", sys.stderr)
 
@@ -162,11 +182,10 @@ class AudioPassthroughStream:
                 else sd.default.device[1]
             )
 
-            # Safely query device capabilities
             in_info = sd.query_devices(target_in, "input")
             out_info = sd.query_devices(target_out, "output")
 
-            in_ch = max(1, min(1, int(in_info.get("max_input_channels", 1))))
+            in_ch = max(1, int(in_info.get("max_input_channels", 1)))
             out_ch = max(1, min(2, int(out_info.get("max_output_channels", 2))))
 
             srate = int(in_info.get("default_samplerate", 44100))
@@ -174,27 +193,24 @@ class AudioPassthroughStream:
                 srate = 44100
             self.sample_rate = srate
 
+            self._update_filter()
+
             self.buffer_size = self.sample_rate * 2
             self.delay_buffer = np.zeros((self.buffer_size, 2), dtype=np.float32)
 
             self.stream = sd.Stream(
                 device=(target_in, target_out),
                 samplerate=self.sample_rate,
-                blocksize=128,  # Low-latency buffer
+                blocksize=256,
                 channels=(in_ch, out_ch),
                 dtype="float32",
                 callback=self._audio_callback,
             )
             self.stream.start()
             self.is_running = True
-            print(
-                f"[Audio Stream] Linux stream active: Mic #{target_in} -> Speaker #{target_out} @ {srate}Hz"
-            )
+            print(f"[Audio Stream] Stream active with High-Pass SOS Filter @ {srate}Hz")
         except Exception as e:
-            print(
-                f"[AudioPassthroughStream Error] Could not start Linux stream: {e}",
-                sys.stderr,
-            )
+            print(f"[Audio Stream Error] {e}", sys.stderr)
             self.is_running = False
 
     def stop(self):
@@ -207,8 +223,8 @@ class AudioPassthroughStream:
             self.stream = None
         self.is_running = False
 
-    def set_volume(self, level_0_to_1):
-        self.volume = level_0_to_1
+    def set_volume(self, level_0_to_3):
+        self.gain = level_0_to_3
 
     def set_echo_params(self, delay_ms, feedback):
         self.echo_delay_ms = delay_ms
@@ -261,9 +277,9 @@ class VideoDisplayWindow(QWidget):
             else:
                 self.showFullScreen()
         elif event.key() in (
-                Qt.Key.Key_N,
-                Qt.Key.Key_Right,
-                Qt.Key.Key_MediaNext,
+            Qt.Key.Key_N,
+            Qt.Key.Key_Right,
+            Qt.Key.Key_MediaNext,
         ):
             if self.skip_callback:
                 self.skip_callback()
@@ -303,7 +319,6 @@ class KTVControlWindow(QMainWindow):
         self.mic1_stream = None
         self.mic2_stream = None
 
-        # Route VLC audio output through PulseAudio daemon
         vlc_flags = [
             "--no-xlib",
             "--aout=pulse",
@@ -316,6 +331,7 @@ class KTVControlWindow(QMainWindow):
 
         self.media_player = self.vlc_instance.media_player_new()
 
+        # Attach handle safely
         window_handle = int(self.display_win.video_frame.winId())
         self.media_player.set_xwindow(window_handle)
 
@@ -479,7 +495,6 @@ class KTVControlWindow(QMainWindow):
 
         left_col.addWidget(music_box)
 
-        # --- MIC 1 CONTROL BOX WITH LIVE VU METER ---
         mic1_box = QGroupBox("🎙️ Microphone 1 Controls")
         mic1_layout = QVBoxLayout(mic1_box)
         m1_dev_row = QHBoxLayout()
@@ -493,11 +508,11 @@ class KTVControlWindow(QMainWindow):
         m1_vol_row = QHBoxLayout()
         m1_vol_row.addWidget(QLabel("Gain Vol:"))
         self.mic1_vol_slider = QSlider(Qt.Orientation.Horizontal)
-        self.mic1_vol_slider.setRange(0, 200)
-        self.mic1_vol_slider.setValue(80)  # Default 80% to avoid initial overdrive
+        self.mic1_vol_slider.setRange(0, 300)
+        self.mic1_vol_slider.setValue(100)
         self.mic1_vol_slider.valueChanged.connect(self.update_mic_settings)
         m1_vol_row.addWidget(self.mic1_vol_slider, stretch=1)
-        self.mic1_vol_label = QLabel("80%")
+        self.mic1_vol_label = QLabel("100%")
         m1_vol_row.addWidget(self.mic1_vol_label)
         mic1_layout.addLayout(m1_vol_row)
 
@@ -516,7 +531,6 @@ class KTVControlWindow(QMainWindow):
 
         left_col.addWidget(mic1_box)
 
-        # --- MIC 2 CONTROL BOX WITH LIVE VU METER ---
         mic2_box = QGroupBox("🎙️ Microphone 2 Controls")
         mic2_layout = QVBoxLayout(mic2_box)
         m2_dev_row = QHBoxLayout()
@@ -530,11 +544,11 @@ class KTVControlWindow(QMainWindow):
         m2_vol_row = QHBoxLayout()
         m2_vol_row.addWidget(QLabel("Gain Vol:"))
         self.mic2_vol_slider = QSlider(Qt.Orientation.Horizontal)
-        self.mic2_vol_slider.setRange(0, 200)
-        self.mic2_vol_slider.setValue(80)  # Default 80% to avoid initial overdrive
+        self.mic2_vol_slider.setRange(0, 300)
+        self.mic2_vol_slider.setValue(100)
         self.mic2_vol_slider.valueChanged.connect(self.update_mic_settings)
         m2_vol_row.addWidget(self.mic2_vol_slider, stretch=1)
-        self.mic2_vol_label = QLabel("80%")
+        self.mic2_vol_label = QLabel("100%")
         m2_vol_row.addWidget(self.mic2_vol_label)
         mic2_layout.addLayout(m2_vol_row)
 
@@ -570,10 +584,10 @@ class KTVControlWindow(QMainWindow):
         decay_row.addWidget(QLabel("Echo Decay:"))
         self.echo_decay_slider = QSlider(Qt.Orientation.Horizontal)
         self.echo_decay_slider.setRange(0, 85)
-        self.echo_decay_slider.setValue(25)  # Default 25% to prevent feedback loops
+        self.echo_decay_slider.setValue(20)
         self.echo_decay_slider.valueChanged.connect(self.update_mic_settings)
         decay_row.addWidget(self.echo_decay_slider, stretch=1)
-        self.echo_decay_label = QLabel("25%")
+        self.echo_decay_label = QLabel("20%")
         decay_row.addWidget(self.echo_decay_label)
         echo_layout.addLayout(decay_row)
         left_col.addWidget(echo_box)
@@ -656,7 +670,6 @@ class KTVControlWindow(QMainWindow):
         root_layout.addLayout(grid_layout)
 
     def set_meter_style(self, progress_bar, is_clipping=False):
-        """Dynamic color style for standard levels vs clipping overload."""
         if is_clipping:
             progress_bar.setStyleSheet("""
                 QProgressBar {
@@ -702,25 +715,17 @@ class KTVControlWindow(QMainWindow):
 
         if self.vocal_mode == "both":
             self.btn_vocal_toggle.setText("🎤 Dual (原唱+伴唱)")
-            self.media_player.audio_set_channel(
-                vlc.AudioOutputChannel.Stereo.value
-            )
+            self.media_player.audio_set_channel(1)
             self.media_player.audio_set_track(1)
         elif self.vocal_mode == "left":
             self.btn_vocal_toggle.setText("🎶 Left Channel (伴唱)")
-            self.media_player.audio_set_channel(
-                vlc.AudioOutputChannel.Left.value
-            )
+            self.media_player.audio_set_channel(3)
         elif self.vocal_mode == "right":
             self.btn_vocal_toggle.setText("🎤 Right Channel (原唱)")
-            self.media_player.audio_set_channel(
-                vlc.AudioOutputChannel.Right.value
-            )
+            self.media_player.audio_set_channel(4)
         elif self.vocal_mode == "track2":
             self.btn_vocal_toggle.setText("🔀 Track 2 Audio Switch")
-            self.media_player.audio_set_channel(
-                vlc.AudioOutputChannel.Stereo.value
-            )
+            self.media_player.audio_set_channel(1)
             self.media_player.audio_set_track(2)
 
         broadcast_system_state()
@@ -769,7 +774,6 @@ class KTVControlWindow(QMainWindow):
                 name = f"[{idx}] {dev['name']}"
                 self.output_combo.addItem(name, userData=idx)
 
-        # Fallback to Pulse/Default virtual nodes first
         if pulse_idx is not None:
             for i in range(self.output_combo.count()):
                 if self.output_combo.itemData(i) == pulse_idx:
@@ -871,7 +875,7 @@ class KTVControlWindow(QMainWindow):
         for root, _, files in os.walk(folder_path):
             for file in files:
                 if file.lower().endswith(
-                        (".mp4", ".mkv", ".avi", ".mov", ".webm", ".mp3")
+                    (".mp4", ".mkv", ".avi", ".mov", ".webm", ".mp3")
                 ):
                     full_path = os.path.join(root, file)
                     song_name = os.path.splitext(file)[0]
