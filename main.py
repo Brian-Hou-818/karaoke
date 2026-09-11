@@ -101,22 +101,21 @@ class AudioPassthroughStream:
         try:
             channels = indata.shape[1]
 
-            # 1. State initialization for filter continuity
-            # zi has shape (n_sections, 2) -> expanded to (n_sections, 2, channels)
+            # State initialization for filter continuity (shape: n_sections, 2, channels)
             if self.filter_state is None or self.filter_state.shape[2] != channels:
                 self.filter_state = np.repeat(self.zi[:, :, np.newaxis], channels, axis=2)
 
-            # 2. High-Pass Filter (Strip static-causing sub-100Hz rumble)
+            # High-Pass Filter (Strip static-causing sub-100Hz rumble)
             filtered, self.filter_state = sosfilt(self.sos, indata, axis=0, zi=self.filter_state)
 
-            # 3. Apply Digital Gain Boost
+            # Apply Digital Gain Boost (supports up to 10.0x)
             amplified = filtered * self.gain
 
-            # 4. Measure Peak and RMS Levels
+            # Measure Peak and RMS Levels
             rms = np.sqrt(np.mean(amplified ** 2))
             peak = np.max(np.abs(amplified))
 
-            # 5. Soft Noise Gate Thresholding
+            # Soft Noise Gate Thresholding
             NOISE_GATE_THRESHOLD = 0.004
             if rms < NOISE_GATE_THRESHOLD:
                 attenuation = max(0.0, (rms / NOISE_GATE_THRESHOLD) ** 2) if NOISE_GATE_THRESHOLD > 0 else 0
@@ -133,7 +132,7 @@ class AudioPassthroughStream:
                 self.emitter.level_signal.emit(int(vol_percent), is_clipping)
                 self._frame_counter = 0
 
-            # 6. Channel Matching
+            # Channel Matching
             in_chans = amplified.shape[1]
             out_chans = outdata.shape[1]
 
@@ -146,7 +145,7 @@ class AudioPassthroughStream:
 
             processed = np.clip(in_samples * 0.95, -1.0, 1.0)
 
-            # 7. Echo / Delay Loop Buffer
+            # Echo / Delay Loop Buffer
             delay_samples = int((self.echo_delay_ms / 1000.0) * self.sample_rate)
             read_indices = (
                 np.arange(self.write_pos, self.write_pos + frames) - delay_samples
@@ -223,8 +222,8 @@ class AudioPassthroughStream:
             self.stream = None
         self.is_running = False
 
-    def set_volume(self, level_0_to_3):
-        self.gain = level_0_to_3
+    def set_volume(self, level_0_to_10):
+        self.gain = float(level_0_to_10)
 
     def set_echo_params(self, delay_ms, feedback):
         self.echo_delay_ms = delay_ms
@@ -313,7 +312,6 @@ class KTVControlWindow(QMainWindow):
         self.selected_queue = []
         self.current_song = None
 
-        self.vocal_mode = "both"
         self.playback_rate = 1.0
 
         self.mic1_stream = None
@@ -397,8 +395,6 @@ class KTVControlWindow(QMainWindow):
             QPushButton#primaryBtn:hover { background-color: #1d4ed8; }
             QPushButton#priorityBtn { background-color: #d97706; }
             QPushButton#priorityBtn:hover { background-color: #b45309; }
-            QPushButton#toggleVocalBtn { background-color: #8b5cf6; }
-            QPushButton#toggleVocalBtn:hover { background-color: #7c3aed; }
             QSlider::groove:horizontal { border: 1px solid #334155; height: 10px; background: #0f172a; border-radius: 5px; }
             QSlider::sub-page:horizontal { background: #3b82f6; border-radius: 5px; }
             QSlider::handle:horizontal { background: #f8fafc; width: 20px; margin-top: -5px; margin-bottom: -5px; border-radius: 10px; }
@@ -463,14 +459,6 @@ class KTVControlWindow(QMainWindow):
         playback_row.addWidget(self.btn_skip)
         music_layout.addLayout(playback_row)
 
-        vocal_row = QHBoxLayout()
-        vocal_row.addWidget(QLabel("<b>Vocal Mode:</b>"))
-        self.btn_vocal_toggle = QPushButton("🎤 Dual (原唱+伴唱)")
-        self.btn_vocal_toggle.setObjectName("toggleVocalBtn")
-        self.btn_vocal_toggle.clicked.connect(self.cycle_vocal_mode)
-        vocal_row.addWidget(self.btn_vocal_toggle, stretch=1)
-        music_layout.addLayout(vocal_row)
-
         tempo_row = QHBoxLayout()
         tempo_row.addWidget(QLabel("<b>Pitch/Speed:</b>"))
         self.tempo_slider = QSlider(Qt.Orientation.Horizontal)
@@ -508,11 +496,11 @@ class KTVControlWindow(QMainWindow):
         m1_vol_row = QHBoxLayout()
         m1_vol_row.addWidget(QLabel("Gain Vol:"))
         self.mic1_vol_slider = QSlider(Qt.Orientation.Horizontal)
-        self.mic1_vol_slider.setRange(0, 300)
+        self.mic1_vol_slider.setRange(0, 1000)  # Extended range to 1000% (10x gain)
         self.mic1_vol_slider.setValue(100)
         self.mic1_vol_slider.valueChanged.connect(self.update_mic_settings)
         m1_vol_row.addWidget(self.mic1_vol_slider, stretch=1)
-        self.mic1_vol_label = QLabel("100%")
+        self.mic1_vol_label = QLabel("100% (1.0x)")
         m1_vol_row.addWidget(self.mic1_vol_label)
         mic1_layout.addLayout(m1_vol_row)
 
@@ -544,11 +532,11 @@ class KTVControlWindow(QMainWindow):
         m2_vol_row = QHBoxLayout()
         m2_vol_row.addWidget(QLabel("Gain Vol:"))
         self.mic2_vol_slider = QSlider(Qt.Orientation.Horizontal)
-        self.mic2_vol_slider.setRange(0, 300)
+        self.mic2_vol_slider.setRange(0, 1000)  # Extended range to 1000% (10x gain)
         self.mic2_vol_slider.setValue(100)
         self.mic2_vol_slider.valueChanged.connect(self.update_mic_settings)
         m2_vol_row.addWidget(self.mic2_vol_slider, stretch=1)
-        self.mic2_vol_label = QLabel("100%")
+        self.mic2_vol_label = QLabel("100% (1.0x)")
         m2_vol_row.addWidget(self.mic2_vol_label)
         mic2_layout.addLayout(m2_vol_row)
 
@@ -705,30 +693,6 @@ class KTVControlWindow(QMainWindow):
             self.play_next()
         elif action == "play_pause":
             self.toggle_play_pause()
-        elif action == "vocal_toggle":
-            self.cycle_vocal_mode()
-
-    def cycle_vocal_mode(self):
-        modes = ["both", "left", "right", "track2"]
-        curr_idx = modes.index(self.vocal_mode)
-        self.vocal_mode = modes[(curr_idx + 1) % len(modes)]
-
-        if self.vocal_mode == "both":
-            self.btn_vocal_toggle.setText("🎤 Dual (原唱+伴唱)")
-            self.media_player.audio_set_channel(1)
-            self.media_player.audio_set_track(1)
-        elif self.vocal_mode == "left":
-            self.btn_vocal_toggle.setText("🎶 Left Channel (伴唱)")
-            self.media_player.audio_set_channel(3)
-        elif self.vocal_mode == "right":
-            self.btn_vocal_toggle.setText("🎤 Right Channel (原唱)")
-            self.media_player.audio_set_channel(4)
-        elif self.vocal_mode == "track2":
-            self.btn_vocal_toggle.setText("🔀 Track 2 Audio Switch")
-            self.media_player.audio_set_channel(1)
-            self.media_player.audio_set_track(2)
-
-        broadcast_system_state()
 
     def change_playback_speed(self, val):
         self.playback_rate = val / 100.0
@@ -852,8 +816,8 @@ class KTVControlWindow(QMainWindow):
         delay_ms = self.echo_delay_slider.value()
         feedback = self.echo_decay_slider.value() / 100.0
 
-        self.mic1_vol_label.setText(f"{self.mic1_vol_slider.value()}%")
-        self.mic2_vol_label.setText(f"{self.mic2_vol_slider.value()}%")
+        self.mic1_vol_label.setText(f"{self.mic1_vol_slider.value()}% ({m1_vol:.1f}x)")
+        self.mic2_vol_label.setText(f"{self.mic2_vol_slider.value()}% ({m2_vol:.1f}x)")
         self.echo_delay_label.setText(f"{delay_ms}ms")
         self.echo_decay_label.setText(f"{self.echo_decay_slider.value()}%")
 
@@ -1087,7 +1051,6 @@ HTML_TEMPLATE = """
         }
         .btn-play { background: #16a34a; }
         .btn-skip { background: #d97706; }
-        .btn-vocal { background: #8b5cf6; }
         input { width: 100%; padding: 12px; box-sizing: border-box; border-radius: 8px; border: 1px solid #334155; background: #1e293b; color: white; font-size: 16px; margin-bottom: 15px; }
         ul { list-style: none; padding: 0; margin: 0; }
         li { background: #1e293b; margin-bottom: 8px; padding: 12px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; border: 1px solid #334155; }
@@ -1111,7 +1074,6 @@ HTML_TEMPLATE = """
 
         <div class="controls-row">
             <button id="btnPlayPause" class="btn-ctrl btn-play" onclick="triggerAction('play_pause')">⏯ Pause</button>
-            <button id="btnVocalToggle" class="btn-ctrl btn-vocal" onclick="triggerAction('vocal_toggle')">🎤 Vocal</button>
             <button class="btn-ctrl btn-skip" onclick="triggerAction('skip')">⏭ Skip</button>
         </div>
     </div>
@@ -1135,12 +1097,6 @@ HTML_TEMPLATE = """
         socket.on('state_update', data => {
             document.getElementById('nowPlayingText').innerText = data.now_playing || 'None';
             document.getElementById('btnPlayPause').innerText = data.is_playing ? '⏸ Pause' : '▶ Play';
-
-            const vocalBtn = document.getElementById('btnVocalToggle');
-            if (data.vocal_mode === 'both') vocalBtn.innerText = '🎤 Dual';
-            else if (data.vocal_mode === 'left') vocalBtn.innerText = '🎶 Left (伴唱)';
-            else if (data.vocal_mode === 'right') vocalBtn.innerText = '🎤 Right (原唱)';
-            else vocalBtn.innerText = '🔀 Track 2';
 
             const queueList = document.getElementById('queueList');
             if (!data.queue || data.queue.length === 0) {
@@ -1229,7 +1185,6 @@ def broadcast_system_state():
         )
         is_playing = control_win.media_player.is_playing() == 1
         queue_titles = [s["name"] for s in control_win.selected_queue]
-        vocal_mode = control_win.vocal_mode
 
         socketio.emit(
             "state_update",
@@ -1237,7 +1192,6 @@ def broadcast_system_state():
                 "now_playing": now_playing,
                 "is_playing": is_playing,
                 "queue": queue_titles,
-                "vocal_mode": vocal_mode,
             },
         )
 

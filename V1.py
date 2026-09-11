@@ -73,7 +73,7 @@ class DualMicEngine:
     """ Hardware-synchronized full-duplex streams """
 
     def __init__(self):
-        self.block_size = 512  # Clean balance between latency and stability
+        self.block_size = 128  # Clean balance between latency and stability
 
         self.mic1_enabled = False
         self.mic1_dev_id = None
